@@ -4,12 +4,12 @@
 
 
 # 使用方法：
-1: 设置相机
-2：创建GaussianDrawObj对象，传入文件路径
-3：调用GaussianDrawObj的getNode()函数返回osg节点， 并将节点加入场景中即可
+# 1: 设置相机
+# 2：创建GaussianDrawObj对象，传入文件路径
+# 3：调用GaussianDrawObj的getNode()函数返回osg节点， 并将节点加入场景中即可
 
 # 示例：
- std::string file = "C:\\Users\\Administrator\\Desktop\\1.splat";
- GaussianDrawObj*pObj = new GaussianDrawObj(file);
- osg::ref_ptr<osg::Node> pGsModul  =  pObj->getNode();
- getRoot()->addChild(pGsModul);
+# std::string file = "C:\\Users\\Administrator\\Desktop\\1.splat";
+# GaussianDrawObj*pObj = new GaussianDrawObj(file);
+# osg::ref_ptr<osg::Node> pGsModul  =  pObj->getNode();
+# getRoot()->addChild(pGsModul);
