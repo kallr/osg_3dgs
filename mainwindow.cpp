@@ -17,8 +17,8 @@ MainWindow::MainWindow(QWidget *parent)
 
     pOSGWnd->loadModule("",true);
 
+	createToolBar();
     setCentralWidget(pOSGWnd);
-     createToolBar();
 }
  
 void MainWindow::createToolBar(){
@@ -58,18 +58,16 @@ void MainWindow::createToolBar(){
 }
 
 void MainWindow::fileNew()
-{
- 
- 
+{ 
 }
 
 void MainWindow::fileOpen()
 {
 	QString fileName = QFileDialog::getOpenFileName();
-
 	std::string stdFile = fileName.toLocal8Bit().constData();
-
 	pOSGWnd->loadModule(stdFile, false);
-
 }
-MainWindow::~MainWindow() {}
+
+MainWindow::~MainWindow() 
+{
+}

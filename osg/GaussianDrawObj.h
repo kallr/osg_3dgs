@@ -9,16 +9,18 @@
 #include "osg\matrixTransform"
  
 
-// ∏ﬂÀπµ„ ˝æ›Ω·ππ
+//gaussian point
 struct MI_GaussianPoint {
-	osg::Vec3f position;
-	osg::Vec4f color;
+	osg::Vec3f position; //position
+	osg::Vec4f color;    //color, rgba
 
-	osg::Vec4f sigma1;
+	//ÂçèÊñπÂ∑ÆÁü©Èòµ
+	osg::Vec4f sigma1;   
 	osg::Vec4f sigma2;
 	osg::Vec4f sigma3;
 };
 
+//gaussian draw obj
 class  GaussianDrawObj
 {
 public:
@@ -26,25 +28,17 @@ public:
 	~GaussianDrawObj();
  
 	bool getDirty();
-	void  setDirty(bool flag);
-
+	void setDirty(bool flag);
  
-	osg::ref_ptr<osg::Node> getNode();
-
- 	void addPt(MI_GaussianPoint* objPos, int id);
-
-	void updateUniforms(osg::Vec4f* ptr,int id);
-
+	//return osg node
+	osg::ref_ptr<osg::Node> getNode(); 
+	//sort
+	void runSortAndUpdate(const osg::Matrix& viewProj, osg::Image* paramsImage);
+private:
 	void updateImage(osg::Image* paramsImage);
+	void loadShader(osg::StateSet* ss);
 	void updateIndexImage(osg::Image* paramsImage);
 
-
-
-	void runSort(const osg::Matrix& viewProj);
-
-	void updateInstanceCount(int newCount);
-private:
-	void loadShader(osg::StateSet* ss);
 	std::vector<MI_GaussianPoint> readSplatFile(const std::string& filename);
 	std::vector<MI_GaussianPoint> readFlyFile(const std::string& filename);
 	osg::ref_ptr<osg::Geometry> createQuadGeometry();
@@ -53,8 +47,6 @@ private:
 	bool bInit=false;
 	bool flag = false;
 	int nNum = 0;
-
-
 	std::vector< MI_GaussianPoint> gaussianPoints;
 	std::vector<int> depthIndex;
 	std::vector<size_t> distances;

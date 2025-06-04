@@ -11,18 +11,13 @@ class QTreeWidget;
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
-
 public:
     MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
-
 public:
- private:
-    GraphicsWindowQt* pOSGWnd= nullptr;
- 
- 
-     void createToolBar();
-
+	void createToolBar();
+private:
+	GraphicsWindowQt* pOSGWnd= nullptr;
 public Q_SLOTS:
     void fileNew();
     void fileOpen();

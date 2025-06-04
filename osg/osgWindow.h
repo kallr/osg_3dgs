@@ -37,9 +37,6 @@ public:
 public:
     void loadModule(const std::string& file,bool bFirst);
 	void fullScreen();
-
-protected:
-
 private:
 	osg::ref_ptr<osg::Camera> createCamera(int x, int y, int w, int h);
 	osgGA::GUIEventAdapter::KeySymbol getKey(int key, const QString& value);

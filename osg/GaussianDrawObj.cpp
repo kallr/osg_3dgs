@@ -75,6 +75,12 @@ public:
 		{
 			pBatchObj_->setDirty(false);
 
+			osg::ref_ptr<osg::TextureBuffer> tbo = dynamic_cast<osg::TextureBuffer*>(ss);
+			osg::Image* indexImage = tbo->getImage();
+			if (!indexImage)
+				return;
+
+
 			osg::Matrixd curViewMat = getCamera()->getProjectionMatrix()* getCamera()->getViewMatrix();
 
 			double  dot =
@@ -82,19 +88,12 @@ public:
 				viewMatrix(1, 2) * curViewMat(1, 2) +
 				viewMatrix(2, 2) * curViewMat(2, 2);
 
-			//if (abs(dot - 1) < 0.01) {
-			//	return;
-			//}
+			if (abs(dot - 1) < 0.01) {
+				return;
+			}
 
 			viewMatrix = curViewMat;
-
-			pBatchObj_->runSort(viewMatrix);
-
-			osg::ref_ptr<osg::TextureBuffer> tbo = dynamic_cast<osg::TextureBuffer*>(ss);
-			osg::Image* paramsImage = tbo->getImage();
-			if (!paramsImage)return;
-
-			pBatchObj_->updateIndexImage(paramsImage);		 
+			pBatchObj_->runSortAndUpdate(viewMatrix,indexImage);
 		}
 	}
 
@@ -135,8 +134,8 @@ void  GaussianDrawObj::setDirty(bool flag)
 }
 
 
-// 输入：点云数据和当前视图投影矩阵
-void GaussianDrawObj::runSort(const osg::Matrix& viewProj)
+// 输入：当前视图投影矩阵,和索引
+void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* paramsImage)
 { 
 	osg::Vec3f cam_pos;
 	osg::Vec3f center;
@@ -175,6 +174,7 @@ void GaussianDrawObj::runSort(const osg::Matrix& viewProj)
 		output[count[j]] = i;
 	}
 	std::swap(output, depthIndex);
+	updateIndexImage(paramsImage);
 }
 
   
@@ -183,10 +183,20 @@ void GaussianDrawObj::updateImage(osg::Image* paramsImage)
 {
 	for(int i = 0; i< nNum; i++)
 	{
+		const MI_GaussianPoint& gsPos = gaussianPoints[i];
 		osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(5 * i);
-
-		updateUniforms(ptr, i);
+		if(ptr)
+		{
+			ptr[0].set(gsPos.position[0], gsPos.position[1], gsPos.position[2], 1);
+			//color
+			ptr[1] = gsPos.color;
+			//con
+			ptr[2] = gsPos.sigma1;
+			ptr[3] = gsPos.sigma2;
+			ptr[4] = gsPos.sigma3;
+		}
  	}
+
 	paramsImage->dirty();
 }
 
@@ -204,20 +214,6 @@ void GaussianDrawObj::updateIndexImage(osg::Image* paramsImage)
 
 	paramsImage->dirty();
 }
-
-void GaussianDrawObj::updateUniforms(osg::Vec4f* ptr, int id)
-{
-	const MI_GaussianPoint& gsPos = gaussianPoints[id];
-
-	//pos
-	ptr[0].set(gsPos.position[0], gsPos.position[1], gsPos.position[2], 1);
-	//color
-	ptr[1] = gsPos.color;
-	//con
-	ptr[2] = gsPos.sigma1;
-	ptr[3] = gsPos.sigma2;
-	ptr[4] = gsPos.sigma3;
- }
 
 
 void GaussianDrawObj::loadShader(osg::StateSet* ss)
