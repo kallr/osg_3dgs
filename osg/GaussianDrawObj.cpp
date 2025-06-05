@@ -1,4 +1,4 @@
-// TH3DGraphLibTestView.cpp : CTHGW3DGraphView ÀàµÄÊµÏÖ
+// TH3DGraphLibTestView.cpp : CTHGW3DGraphView ï¿½ï¿½ï¿½Êµï¿½ï¿½
 //
 #include "GaussianDrawObj.h"
 
@@ -134,7 +134,7 @@ void  GaussianDrawObj::setDirty(bool flag)
 }
 
 
-// ÊäÈë£ºµ±Ç°ÊÓÍ¼Í¶Ó°¾ØÕó,ºÍË÷Òı
+//é«˜æ–¯ç‚¹æ’åº
 void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* paramsImage)
 { 
 	osg::Vec3f cam_pos;
@@ -142,16 +142,14 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
 	osg::Vec3f up;
 	getCamera()->getViewMatrixAsLookAt(cam_pos, center, up);
 
+	// 65535 æ˜¯ä¸€ä¸ªå¸¸è§çš„æ¡¶æ•°é‡ï¼Œå®ƒå¯ä»¥è¦†ç›–å¤§å¤šæ•°çš„è·ç¦»èŒƒå›´ï¼Œ
 	const size_t n_buckets = 65535;
-	std::vector<size_t> count(n_buckets + 1, 0);
-
-	int num_gaussians = gaussianPoints.size();
+	std::vector<size_t> count(n_buckets + 1, 0); 
   
-	std::vector<int> output(num_gaussians, 0);
+	std::vector<int> output(nNum, 0);
 
 	float max_dist = 1.2f *2 * bounds.radius();
 	max_dist *= max_dist;
-
  	for (int i = 0; i< gaussianPoints.size(); i++)
 	{
 		const auto& g = gaussianPoints[i];
@@ -178,7 +176,6 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
 }
 
   
-
 void GaussianDrawObj::updateImage(osg::Image* paramsImage)
 {
 	for(int i = 0; i< nNum; i++)
@@ -196,7 +193,6 @@ void GaussianDrawObj::updateImage(osg::Image* paramsImage)
 			ptr[4] = gsPos.sigma3;
 		}
  	}
-
 	paramsImage->dirty();
 }
 
@@ -238,7 +234,6 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 	osg::ref_ptr<osg::Geometry> pInstance = createQuadGeometry(); 
 	geode->addChild(pInstance);
 
-
 	//index buffer
 	{
 		osg::ref_ptr<osg::Image> paramsImage = new osg::Image;
@@ -271,9 +266,7 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 	if (stateset)
 	{
 		loadShader(stateset);
-
 		stateset->setUpdateCallback(new SSCallback(this));
-
 
 		osg::Uniform* indexBufferSampler = new osg::Uniform("indexBuffer", int(0));
 		stateset->addUniform(indexBufferSampler);
@@ -282,11 +275,12 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 		stateset->addUniform(dataBufferSampler);
 
 
-		//½ûÓÃÉî¶È²âÊÔ
+		//ç¦ç”¨æ·±åº¦æµ‹è¯•
 		stateset->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
 
-		// ÆôÓÃ»ìºÏ
+		//å¯åŠ¨æ··åˆ
 		stateset->setMode(GL_BLEND, osg::StateAttribute::ON);
+		//è®¾ç½®æ··åˆæ–¹ç¨‹å’Œæ··åˆå› å­
 		osg::ref_ptr<osg::BlendFunc> blendFunc = new osg::BlendFunc();
 		blendFunc->setFunction(
 			osg::BlendFunc::DST_ALPHA, osg::BlendFunc::ONE, // RGB
@@ -311,12 +305,12 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 	}
 
 
-	// ¼ÙÉèÃ¿¸öµãµÄÊı¾İ²¼¾Ö
+	//é«˜æ–¯ç‚¹ç»“æ„ä½“  
 	struct Splat {
-		float pos[3];      // Î»ÖÃ (x,   y,  z)
-		float scale[3];    // Ëõ·Å (sx, sy, sz)
-		uint8_t color[4];  // ÑÕÉ« (r,   g,  b,a)
-		uint8_t rot[4];    // Ğı×ªËÄÔªÊı (w, x, y, z)
+		float pos[3];      // ä½ç½®R3 (x,   y,  z)
+		float scale[3];    // ç¼©æ”¾ç³»æ•°R3(sx, sy, sz)
+		uint8_t color[4];  // é¢œè‰²R4(r,   g,  b,a)
+		uint8_t rot[4];    // æ—‹è½¬4å…ƒæ•°R4(w, x, y, z)
 	};
 
 	Splat splat;
@@ -325,6 +319,7 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 		MI_GaussianPoint point;
 		point.position.set(splat.pos[0], splat.pos[1], splat.pos[2]);
 
+		// é¢œè‰²å€¼èŒƒå›´æ˜¯0-255ï¼Œéœ€è¦è½¬æ¢åˆ°0-1
 		point.color.set(splat.color[0], splat.color[1], splat.color[2], splat.color[3]);
 		point.color /= 255.0;
 
@@ -336,6 +331,7 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 
 		glm::mat4 scale_mat = glm::scale(glm::mat4(1.0f), scale);
 
+		// æ—‹è½¬å€¼èŒƒå›´æ˜¯-128-127ï¼Œéœ€è¦è½¬æ¢åˆ°-1-1
 		float rx = (1.0 * splat.rot[0] - 128.0) / 128.0;
 		float ry = (1.0 * splat.rot[1] - 128.0) / 128.0;
 		float rz = (1.0 * splat.rot[2] - 128.0) / 128.0;
@@ -345,6 +341,7 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 
 		glm::mat4 rot_mat = glm::mat4(glm::mat3(rot));
 
+		// è®¡ç®—åæ–¹å·®çŸ©é˜µ
 		auto rot_scale = rot_mat * scale_mat;
 		glm::mat4 sigma = rot_scale * glm::transpose(rot_scale);
 
@@ -352,6 +349,7 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 		point.sigma2 = osg::Vec4f(sigma[1][0], sigma[1][1], sigma[1][2], sigma[1][3]);
 		point.sigma3 = osg::Vec4f(sigma[2][0], sigma[2][1], sigma[2][2], sigma[2][3]);
 
+		// è®¡ç®—è¾¹ç•Œ
 		bounds.expandBy(point.position);
 
 		points.push_back(point);
@@ -365,6 +363,8 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& ply_path)
 {
 	std::vector<MI_GaussianPoint> points;
+
+	// å®šä¹‰å¸¸é‡ï¼Œè®¡ç®—çƒè°ç³»æ•°
 
  	const float SH_0 = 0.28209479177387814f;
 	const std::vector<std::string> properties = {
@@ -383,6 +383,7 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 	"rot_2",
 	"rot_3",
 	};
+
 	miniply::PLYReader reader(ply_path.c_str());
 	if (!reader.valid()) {
 		std::cerr << "Failed to open " << ply_path << std::endl;
@@ -428,7 +429,9 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 		};
 
 		// Extract base color from spherical harmonics
+		//ä»çƒè°å‡½æ•°è®¡ç®—åŸºç¡€é¢œè‰²
 		g.color = g.color*SH_0 + osg::Vec4f(0.5, 0.5, 0.5, 0.5);
+		//ä½¿ç”¨simgoidå‡½æ•°è®¡ç®—é€æ˜åº¦
 		g.color[3] = 1.0f / (1.0f + exp(-(filedata[offset + 6])));
 
 		glm::vec3 scale = {
@@ -466,20 +469,17 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 
 osg::ref_ptr<osg::Geometry> GaussianDrawObj::createQuadGeometry()
 { 
-	// ´´½¨ËÄ±ßĞÎ¼¸ºÎÌå£¨ÓÃÓÚÊµÀı»¯äÖÈ¾£©
 	osg::ref_ptr<osg::Geometry> quad = new osg::Geometry;
 
-	// ¶¥µãÎ»ÖÃ£¨µ¥Î»ËÄ±ßĞÎ£©
 	osg::ref_ptr<osg::Vec2Array> vertices = new osg::Vec2Array;
-	vertices->push_back(osg::Vec2(-2.0f, -2.0f)); // ×óÏÂ
-	vertices->push_back(osg::Vec2(2.0f, -2.0f));  // ÓÒÏÂ
-	vertices->push_back(osg::Vec2(2.0f, 2.0f));   // ÓÒÉÏ
-	vertices->push_back(osg::Vec2(-2.0f, 2.0f));  // ×óÉÏ
+	vertices->push_back(osg::Vec2(-2.0f, -2.0f)); 
+	vertices->push_back(osg::Vec2(2.0f, -2.0f));  
+	vertices->push_back(osg::Vec2(2.0f, 2.0f));   
+	vertices->push_back(osg::Vec2(-2.0f, 2.0f));  
 
 	quad->setVertexArray(vertices);
 	quad->setVertexAttribArray(0, vertices, osg::Array::BIND_PER_VERTEX);
-
-	// ¶¥µãË÷Òı
+	
 	osg::ref_ptr<osg::DrawArrays> indices = new osg::DrawArrays(GL_TRIANGLE_FAN, 0, 4, nNum);
 
 	quad->addPrimitiveSet(indices);
@@ -487,10 +487,8 @@ osg::ref_ptr<osg::Geometry> GaussianDrawObj::createQuadGeometry()
 	quad->setCullingActive(false);
 	quad->setUseDisplayList(false);
 	quad->setUseVertexBufferObjects(true);
-
 	return quad;
 }
-
 
 osg::Camera* g_camera = nullptr;
 void setMainCamera(osg::Camera* pC) {
