@@ -4,18 +4,19 @@
 
 
 ### 使用方法：
-#### 1: 设置相机
-#### 2：创建GaussianDrawObj对象，传入文件路径
-#### 3：调用GaussianDrawObj的getNode()函数返回osg节点， 并将节点加入场景中即可
+
+- 1: 设置相机
+- 2：创建GaussianDrawObj对象，传入文件路径
+- 3：调用GaussianDrawObj的getNode()函数返回osg节点， 并将节点加入场景中即可
 
 ### 编译
-#### 1：从github上下载代码
-#### 2：mkdir build && cd build && cmake .. && make -j4
-#### 3: 将shader目录copy到build/bin目录下
-#### 4: 运行需要qt 和osg库
+- 1：从github上下载代码
+- 2：mkdir build && cd build && cmake .. && make -j4
+- 3: 将shader目录copy到build/bin目录下
+- 4: 运行需要qt 和osg库
 
 ### 示例：
-std::string file = "C:\\1.splat";   
-GaussianDrawObj*pObj = new GaussianDrawObj(file);   
-osg::ref_ptr<osg::Node> pGsModul  =  pObj->getNode();   
-getRoot()->addChild(pGsModul);   
+- std::string file = "C:\\1.splat";
+- GaussianDrawObj* pObj = new GaussianDrawObj(file);
+- osg::ref_ptr<osg::Node> pGsModul  =  pObj->getNode();
+- getRoot()->addChild(pGsModul);
