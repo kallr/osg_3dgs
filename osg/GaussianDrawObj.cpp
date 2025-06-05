@@ -221,7 +221,7 @@ void GaussianDrawObj::loadShader(osg::StateSet* ss)
 	osg::ref_ptr<osg::Program> gsProgram = new osg::Program;
 	if(gsProgram)
 	{
-		std::string strDir = osg_tools::getAppDir() +  "\\shader\\";
+		std::string strDir = osg_tools::getAppDir()  +  "\\shader\\";
 		osg::Shader* vertex_shader = osgDB::readShaderFile(  osg::Shader::VERTEX,   strDir + "gaussian.vert");
 		osg::Shader* fragment_shader = osgDB::readShaderFile(osg::Shader::FRAGMENT, strDir + "gaussian.frag");
 		gsProgram->addShader(vertex_shader);
@@ -313,9 +313,9 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 
 	// 假设每个点的数据布局
 	struct Splat {
-		float pos[3];    // 位置 (x, y, z)
-		float scale[3];  // 缩放 (sx, sy, sz)
-		uint8_t color[4];  // 颜色 (r, g, b,a)
+		float pos[3];      // 位置 (x,   y,  z)
+		float scale[3];    // 缩放 (sx, sy, sz)
+		uint8_t color[4];  // 颜色 (r,   g,  b,a)
 		uint8_t rot[4];    // 旋转四元数 (w, x, y, z)
 	};
 
