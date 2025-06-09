@@ -15,14 +15,6 @@ set (CMAKE_AUTORCC ON)
 set (CMAKE_AUTOUIC ON)
 
 
-# 路径设置
-if(WIN32)
-    list(APPEND CMAKE_PREFIX_PATH "F:/QT/5.15.2/5.15.2/msvc2019_64")
-    list(APPEND CMAKE_PREFIX_PATH "I:/thbim/3rd/OpenSceneGraph-3.6.5")
-elseif(UNIX)
-    list(APPEND CMAKE_PREFIX_PATH "/usr/local/QT")
-endif()
-
 # 自动寻找QT5
 find_package (Qt5 COMPONENTS Widgets Core Gui OpenGL REQUIRED)
 
