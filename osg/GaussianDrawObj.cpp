@@ -153,7 +153,7 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
  	for (int i = 0; i< gaussianPoints.size(); i++)
 	{
 		const auto& g = gaussianPoints[i];
-		auto v = -cam_pos - g.position;
+		auto v = g.position - cam_pos;
 		float d = v.x() * v.x() + v.y() * v.y() + v.z() * v.z();  // dot product
 		float d_normalized = n_buckets * d / max_dist;  // between 0 and n_buckets
 		size_t d_int = std::min(d_normalized, (float)n_buckets - 1);
@@ -165,7 +165,7 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
 		count[i] = count[i] + count[i - 1];
 	}
 
-	for (int i = num_gaussians - 1; i >= 0; --i)
+	for (int i = nNum - 1; i >= 0; --i)
 	{
 		size_t j = distances[i];
 		--count[j];
