@@ -150,7 +150,10 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
 
 	float max_dist = 1.2f *2 * bounds.radius();
 	max_dist *= max_dist;
- 	for (int i = 0; i< gaussianPoints.size(); i++)
+
+	size_t num_gaussians = gaussianPoints.size();
+
+ 	for (int i = 0; i< num_gaussians; i++)
 	{
 		const auto& g = gaussianPoints[i];
 		auto v = -cam_pos - g.position;

@@ -33,6 +33,7 @@ void MainWindow::createToolBar(){
     toolBar->setMovable(false);         // 设置工具栏不允许移动
 
     //new
+	if(0)
     {
         QAction* newAction = new QAction(QIcon(), tr("&New"), this);
         newAction->setPriority(QAction::LowPriority);
