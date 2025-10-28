@@ -1,7 +1,5 @@
 #include "tools.h"
 
-#include "osg/Geode"
-#include "osg/Group"
 
 #include "QCoreApplication"
 

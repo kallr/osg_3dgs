@@ -80,6 +80,7 @@ void GraphicsWindowQt::keyPressEvent(QKeyEvent *event)
 	osgGA::GUIEventAdapter::KeySymbol key = getKey(event->key(), event->text());
 	if ((int)key == 0) return;  // not recognized
 
+	//键盘c，进行高斯点云排序
 	if (event->text() == 'c' || event->text() == 'C')
 		pObj->setDirty(true);
 
@@ -187,6 +188,7 @@ void GraphicsWindowQt::mouseMoveEvent(QMouseEvent *event)
     update();
 }
  
+
 void GraphicsWindowQt::wheelEvent(QWheelEvent *event)
 {
     setKeyboardModifiers(event);
@@ -245,30 +247,34 @@ void GraphicsWindowQt::clear()
 	root->removeChildren(0, root->getNumChildren());
 } 
 
-void GraphicsWindowQt::loadModule(const std::string& file,bool bFirst)
+void GraphicsWindowQt::loadModule(const std::string& file)
 {	
 	getCamera()->getGraphicsContext()->getState()->setUseModelViewAndProjectionUniforms(true);
 
 	root->removeChildren(0, root->getNumChildren());
 
-	osg::ref_ptr<osg::Node>pLoadedNode;
-	if(bFirst)
-		pLoadedNode = osgDB::readNodeFile(file); 
-	else
-	{
-		setMainCamera(getCamera() );
+	if (pObj) {
+		delete pObj; pObj = nullptr;
+	}
 
+	osg::ref_ptr<osg::Node>pLoadedNode;
+	if (file.find(".splat") != -1 || file.find(".ply") != -1)
+	{
+		setMainCamera(getCamera());
 		pObj = new GaussianDrawObj(file);
 		if (pObj)
-			pLoadedNode=  pObj->getNode();
+			pLoadedNode = pObj->getNode();
+	}
+	else
+	{
+		pLoadedNode = osgDB::readNodeFile(file);
 	}
 
     if (!pLoadedNode) return ;
 
 	root->addChild(pLoadedNode);
-	fullScreen();
 
- 
+	fullScreen(); 
 }
 
 
@@ -378,37 +384,35 @@ void GraphicsWindowQt::fullScreen()
 	root->accept(vi);
 
 	const osg::BoundingBox& bb = vi.getBoundingBox();
- 
 
+	auto _cameraManipulator=  getCameraManipulator();
 
-		auto _cameraManipulator=  getCameraManipulator();
+ 	osg::Camera* camera =getCamera();
 
- 		osg::Camera* camera =getCamera();
+	double fovy, aspectRatio, zNear, zFar;
+	camera->getProjectionMatrixAsPerspective(fovy, aspectRatio, zNear, zFar);
 
-		double fovy, aspectRatio, zNear, zFar;
-		camera->getProjectionMatrixAsPerspective(fovy, aspectRatio, zNear, zFar);
+	osg::Vec3d eye, center, up;
+	camera->getViewMatrixAsLookAt(eye, center, up);
 
-		osg::Vec3d eye, center, up;
-		camera->getViewMatrixAsLookAt(eye, center, up);
+	if (!eye.valid() || !center.valid() || !up.valid())
+	{
+		eye = osg::Vec3(0, 0, 2000);
+		center = osg::Vec3();
+		up = osg::Vec3(0, 1, 0);
+	}
 
-		if (!eye.valid() || !center.valid() || !up.valid())
-		{
-			eye = osg::Vec3(0, 0, 2000);
-			center = osg::Vec3();
-			up = osg::Vec3(0, 1, 0);
-		}
+	osg::Vec3d dir = center - eye;
+	dir.normalize();
+	//double viewDistance = std::max((zFar - zNear) * 0.7, 1.0);
 
-		osg::Vec3d dir = center - eye;
-		dir.normalize();
-		//double viewDistance = std::max((zFar - zNear) * 0.7, 1.0);
+	double tanValue2 = tan(fovy*0.5*M_PI / 180);
+	double	distance = bb.radius() / tanValue2;
 
-		double tanValue2 = tan(fovy*0.5*M_PI / 180);
-		double	distance = bb.radius() / tanValue2;
+	double dis = getNearDistance(camera, bb, distance);
 
-		double dis = getNearDistance(camera, bb, distance);
-
-		osg::Vec3d homeEye = bb.center() - dir * dis;
-		_cameraManipulator->setHomePosition(homeEye, bb.center(), up);
+	osg::Vec3d homeEye = bb.center() - dir * dis;
+	_cameraManipulator->setHomePosition(homeEye, bb.center(), up);
   
 	_cameraManipulator->home(0.0);
 }

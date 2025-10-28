@@ -3,9 +3,6 @@
 
 #include <QMainWindow>
 class GraphicsWindowQt;
-class MI_TreeItem;
-class QTreeWidgetItem;
-class QTreeWidget;
 
 //qt main wnd
 class MainWindow : public QMainWindow
@@ -19,7 +16,6 @@ public:
 private:
 	GraphicsWindowQt* pOSGWnd= nullptr;
 public Q_SLOTS:
-    void fileNew();
     void fileOpen();
 };
 #endif // MAINWINDOW_H

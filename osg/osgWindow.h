@@ -6,7 +6,6 @@
 #include <osgViewer/GraphicsWindow>
  
 class QInputEvent;
-struct MI_TreeItem;
 class GaussianDrawObj;
 
 
@@ -35,7 +34,7 @@ public:
     void timerEvent(QTimerEvent *);
 	bool event(QEvent *e);
 public:
-    void loadModule(const std::string& file,bool bFirst);
+    void loadModule(const std::string& file);
 	void fullScreen();
 private:
 	osg::ref_ptr<osg::Camera> createCamera(int x, int y, int w, int h);

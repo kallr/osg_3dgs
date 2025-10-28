@@ -1,14 +1,11 @@
 #ifndef TOOLS_H
 #define TOOLS_H
+#include <string>
 
-#include "osg/NodeVisitor"
-#include <stack>
  
  
 namespace osg_tools
 {
-	 
-
 	std::string getAppDir();
 }
 #endif
