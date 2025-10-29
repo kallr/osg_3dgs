@@ -1,5 +1,4 @@
-// TH3DGraphLibTestView.cpp : CTHGW3DGraphView ���ʵ��
-//
+
 #include "GaussianDrawObj.h"
 
 #include "osg/Material"
