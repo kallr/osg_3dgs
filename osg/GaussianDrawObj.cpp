@@ -180,19 +180,26 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
   
 void GaussianDrawObj::updateImage(osg::Image* paramsImage)
 {
+	// 每个高斯点占17个Vec4f：
+	//   [0] pos, [1] color, [2-4] sigma, [5-16] SH系数(45float packed进12个Vec4f)
+	const int stride = 17;
 	for(int i = 0; i< nNum; i++)
 	{
 		const MI_GaussianPoint& gsPos = gaussianPoints[i];
-		osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(5 * i);
+		osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(stride * i);
 		if(ptr)
 		{
 			ptr[0].set(gsPos.position[0], gsPos.position[1], gsPos.position[2], 1);
-			//color
 			ptr[1] = gsPos.color;
-			//con
 			ptr[2] = gsPos.sigma1;
 			ptr[3] = gsPos.sigma2;
 			ptr[4] = gsPos.sigma3;
+			// 写入45个SH系数到 ptr[5]~ptr[16]（共12个Vec4f，最后3个float为padding）
+			float* shPtr = (float*)&ptr[5];
+			for (int k = 0; k < 45; ++k)
+				shPtr[k] = gsPos.sh[k];
+			// 最后3个padding置零
+			shPtr[45] = shPtr[46] = shPtr[47] = 0.0f;
 		}
  	}
 	paramsImage->dirty();
@@ -253,7 +260,7 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 	//data buffer
 	{
 		osg::ref_ptr<osg::Image> paramsImage = new osg::Image;
-		int transPos = 5 * nNum;
+		int transPos = 17 * nNum;  // 每点17个Vec4f：5个基础 + 12个SH
 		paramsImage->allocateImage(transPos, 1, 1, GL_RGBA, GL_FLOAT);
 		updateImage(paramsImage);
 
@@ -369,22 +376,29 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 	// 定义常量，计算球谐系数
 
  	const float SH_0 = 0.28209479177387814f;
+	// 基础属性：位置、DC颜色、不透明度、缩放、旋转
 	const std::vector<std::string> properties = {
-	"x",
-	"y",
-	"z",
-	"f_dc_0",
-	"f_dc_1",
-	"f_dc_2",
-	"opacity",
-	"scale_0",
-	"scale_1",
-	"scale_2",
-	"rot_0",
-	"rot_1",
-	"rot_2",
-	"rot_3",
+	"x",       // 0
+	"y",       // 1
+	"z",       // 2
+	"f_dc_0",  // 3
+	"f_dc_1",  // 4
+	"f_dc_2",  // 5
+	"opacity", // 6
+	"scale_0", // 7
+	"scale_1", // 8
+	"scale_2", // 9
+	"rot_0",   // 10
+	"rot_1",   // 11
+	"rot_2",   // 12
+	"rot_3",   // 13
 	};
+	// 1~3阶球谐系数：f_rest_0 ~ f_rest_44，RGB各15个
+	// PLY中存储顺序: R0..R14, G0..G14, B0..B14
+	std::vector<std::string> shProperties;
+	shProperties.reserve(45);
+	for (int i = 0; i < 45; ++i)
+		shProperties.push_back("f_rest_" + std::to_string(i));
 
 	miniply::PLYReader reader(ply_path.c_str());
 	if (!reader.valid()) {
@@ -401,15 +415,32 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 
 	// Getting all the indices where the relevant splat data is stored in the file
 	std::vector<uint32_t> gaussSplatIdx(properties.size());
-
 	for (int i = 0; i < properties.size(); ++i) {
 		gaussSplatIdx[i] = gsSplatEl->find_property(properties[i].c_str());
 	}
+	// 查找球谐属性索引，记录哪些存在
+	std::vector<uint32_t> shIdx(45);
+	int validSHCount = 0;
+	for (int i = 0; i < 45; ++i) {
+		shIdx[i] = gsSplatEl->find_property(shProperties[i].c_str());
+		if (shIdx[i] != miniply::kInvalidIndex)
+			++validSHCount;
+	}
+	bool hasSH = (validSHCount > 0);
 
 	reader.load_element();
 	float* filedata = new float[properties.size() * num_gaussians];
 	reader.extract_properties(
 		gaussSplatIdx.data(), properties.size(), miniply::PLYPropertyType::Float, filedata);
+
+
+	// 读取球谐系数
+	float* shdata = nullptr;
+	if (hasSH) {
+		shdata = new float[45 * num_gaussians]();
+		reader.extract_properties(
+			shIdx.data(), 45, miniply::PLYPropertyType::Float, shdata);
+	}
 
 	// Creating gaussian splats based on the data we read in
 	for (size_t i = 0; i < num_gaussians; ++i) {
@@ -435,6 +466,13 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 		g.color = g.color*SH_0 + osg::Vec4f(0.5, 0.5, 0.5, 0.5);
 		//使用simgoid函数计算透明度
 		g.color[3] = 1.0f / (1.0f + exp(-(filedata[offset + 6])));
+
+		// 存储1~3阶球谐系数
+		if (hasSH) {
+			int shOffset = (int)i * 45;
+			for (int k = 0; k < 45; ++k)
+				g.sh[k] = shdata[shOffset + k];
+		}
 
 		glm::vec3 scale = {
 					glm::exp(filedata[offset + 7]),
@@ -465,8 +503,9 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 	}
 	// Clean up the float array as the gaussians are now stored in the vec "data"
 	delete[] filedata;
+	delete[] shdata;
 
-	return points; 
+	return points;
 }
 
 osg::ref_ptr<osg::Geometry> GaussianDrawObj::createQuadGeometry()

@@ -12,12 +12,16 @@
 //gaussian point
 struct MI_GaussianPoint {
 	osg::Vec3f position; //position
-	osg::Vec4f color;    //color, rgba
+	osg::Vec4f color;    //color, rgba (DC项基础色，rgba)
 
 	//协方差矩阵
-	osg::Vec4f sigma1;   
+	osg::Vec4f sigma1;
 	osg::Vec4f sigma2;
 	osg::Vec4f sigma3;
+
+	// 球谐系数 1~3阶，RGB各15个，共45个 (f_rest_0 ~ f_rest_44)
+	// 布局: [R1,R2,...,R15, G1,...,G15, B1,...,B15]
+	float sh[45] = {};
 };
 
 //gaussian draw obj
