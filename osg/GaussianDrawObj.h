@@ -40,6 +40,7 @@ public:
 	void runSortAndUpdate(const osg::Matrix& viewProj, osg::Image* paramsImage);
 private:
 	void updateImage(osg::Image* paramsImage);
+	void updateSHImage(osg::Image* paramsImage);
 	void loadShader(osg::StateSet* ss);
 	void updateIndexImage(osg::Image* paramsImage);
 
@@ -50,6 +51,7 @@ private:
 	bool bDirty = false;
 	bool bInit=false;
 	bool flag = false;
+	bool hasSH = false;
 	int nNum = 0;
 	std::vector< MI_GaussianPoint> gaussianPoints;
 	std::vector<int> depthIndex;

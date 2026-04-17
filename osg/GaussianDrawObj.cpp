@@ -180,9 +180,9 @@ void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* p
   
 void GaussianDrawObj::updateImage(osg::Image* paramsImage)
 {
-	// 每个高斯点占17个Vec4f：
-	//   [0] pos, [1] color, [2-4] sigma, [5-16] SH系数(45float packed进12个Vec4f)
-	const int stride = 17;
+	// 每个高斯点占5个Vec4f：
+	//   [0] pos, [1] color, [2-4] sigma
+	const int stride = 5;
 	for(int i = 0; i< nNum; i++)
 	{
 		const MI_GaussianPoint& gsPos = gaussianPoints[i];
@@ -194,14 +194,29 @@ void GaussianDrawObj::updateImage(osg::Image* paramsImage)
 			ptr[2] = gsPos.sigma1;
 			ptr[3] = gsPos.sigma2;
 			ptr[4] = gsPos.sigma3;
-			// 写入45个SH系数到 ptr[5]~ptr[16]（共12个Vec4f，最后3个float为padding）
-			float* shPtr = (float*)&ptr[5];
-			for (int k = 0; k < 45; ++k)
-				shPtr[k] = gsPos.sh[k];
-			// 最后3个padding置零
-			shPtr[45] = shPtr[46] = shPtr[47] = 0.0f;
 		}
  	}
+	paramsImage->dirty();
+}
+
+void GaussianDrawObj::updateSHImage(osg::Image* paramsImage)
+{
+	// 每个高斯点的SH系数占12个Vec4f（45个float + 3个padding = 48个float = 12个Vec4f）
+	// 存储顺序: R(sh1..sh15), G(sh1..sh15), B(sh1..sh15)
+	const int shStride = 12;
+	for(int i = 0; i< nNum; i++)
+	{
+		const MI_GaussianPoint& gsPos = gaussianPoints[i];
+		osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(shStride * i);
+		if(ptr)
+		{
+			float* shPtr = (float*)ptr;
+			for (int k = 0; k < 45; ++k)
+				shPtr[k] = gsPos.sh[k];
+			// padding
+			shPtr[45] = shPtr[46] = shPtr[47] = 0.0f;
+		}
+	}
 	paramsImage->dirty();
 }
 
@@ -238,9 +253,9 @@ void GaussianDrawObj::loadShader(osg::StateSet* ss)
  
 osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 {
-	osg::ref_ptr<osg::Geode> geode = new osg::Geode; 
- 
-	osg::ref_ptr<osg::Geometry> pInstance = createQuadGeometry(); 
+	osg::ref_ptr<osg::Geode> geode = new osg::Geode;
+
+	osg::ref_ptr<osg::Geometry> pInstance = createQuadGeometry();
 	geode->addChild(pInstance);
 
 	//index buffer
@@ -260,7 +275,7 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 	//data buffer
 	{
 		osg::ref_ptr<osg::Image> paramsImage = new osg::Image;
-		int transPos = 17 * nNum;  // 每点17个Vec4f：5个基础 + 12个SH
+		int transPos = 5 * nNum;  // 每点5个Vec4f：pos + color + sigma1-3
 		paramsImage->allocateImage(transPos, 1, 1, GL_RGBA, GL_FLOAT);
 		updateImage(paramsImage);
 
@@ -268,6 +283,20 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 		tbo->setImage(paramsImage.get());
 		tbo->setInternalFormat(GL_RGBA32F_ARB);
 		pInstance->getOrCreateStateSet()->setTextureAttribute(1, tbo.get());
+	}
+
+	//sh buffer (separate TBO for spherical harmonics)
+	if (hasSH)
+	{
+		osg::ref_ptr<osg::Image> shImage = new osg::Image;
+		int shTransPos = 12 * nNum;  // 每点12个Vec4f（45个SH float + 3个padding）
+		shImage->allocateImage(shTransPos, 1, 1, GL_RGBA, GL_FLOAT);
+		updateSHImage(shImage);
+
+		osg::ref_ptr<osg::TextureBuffer> shTbo = new osg::TextureBuffer;
+		shTbo->setImage(shImage.get());
+		shTbo->setInternalFormat(GL_RGBA32F_ARB);
+		pInstance->getOrCreateStateSet()->setTextureAttribute(2, shTbo.get());
 	}
 
 	//ss
@@ -282,6 +311,12 @@ osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 
 		osg::Uniform* dataBufferSampler = new osg::Uniform("dataBuffer", int(1));
 		stateset->addUniform(dataBufferSampler);
+
+		osg::Uniform* shBufferSampler = new osg::Uniform("shBuffer", int(2));
+		stateset->addUniform(shBufferSampler);
+
+		osg::Uniform* hasSHUniform = new osg::Uniform("hasSH", hasSH);
+		stateset->addUniform(hasSHUniform);
 
 
 		//禁用深度测试
@@ -418,28 +453,37 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 	for (int i = 0; i < properties.size(); ++i) {
 		gaussSplatIdx[i] = gsSplatEl->find_property(properties[i].c_str());
 	}
-	// 查找球谐属性索引，记录哪些存在
-	std::vector<uint32_t> shIdx(45);
-	int validSHCount = 0;
+	// 查找球谐属性索引，只收集有效的
+	std::vector<uint32_t> validShIdx;
+	std::vector<int> validShPos; // 对应在 sh[45] 中的位置
 	for (int i = 0; i < 45; ++i) {
-		shIdx[i] = gsSplatEl->find_property(shProperties[i].c_str());
-		if (shIdx[i] != miniply::kInvalidIndex)
-			++validSHCount;
+		uint32_t idx = gsSplatEl->find_property(shProperties[i].c_str());
+		if (idx != miniply::kInvalidIndex) {
+			validShIdx.push_back(idx);
+			validShPos.push_back(i);
+		}
 	}
-	bool hasSH = (validSHCount > 0);
+	bool hasSH = !validShIdx.empty();
 
 	reader.load_element();
 	float* filedata = new float[properties.size() * num_gaussians];
 	reader.extract_properties(
 		gaussSplatIdx.data(), properties.size(), miniply::PLYPropertyType::Float, filedata);
 
-
-	// 读取球谐系数
+	// 读取球谐系数（只读有效属性，避免 kInvalidIndex 导致 extract_properties 返回 false）
 	float* shdata = nullptr;
 	if (hasSH) {
-		shdata = new float[45 * num_gaussians]();
+		int nValid = (int)validShIdx.size();
+		float* rawSH = new float[nValid * num_gaussians]();
 		reader.extract_properties(
-			shIdx.data(), 45, miniply::PLYPropertyType::Float, shdata);
+			validShIdx.data(), nValid, miniply::PLYPropertyType::Float, rawSH);
+		// 展开到 45 槽位（无效位置保持 0）
+		shdata = new float[45 * num_gaussians]();
+		for (size_t i = 0; i < num_gaussians; ++i) {
+			for (int k = 0; k < nValid; ++k)
+				shdata[i * 45 + validShPos[k]] = rawSH[i * nValid + k];
+		}
+		delete[] rawSH;
 	}
 
 	// Creating gaussian splats based on the data we read in
@@ -505,6 +549,7 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 	delete[] filedata;
 	delete[] shdata;
 
+	this->hasSH = hasSH;
 	return points;
 }
 

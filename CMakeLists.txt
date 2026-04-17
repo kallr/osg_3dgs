@@ -136,7 +136,7 @@ MACRO(LINK_OSG_LIBRARY PROJECT_NAME)
         ENDIF()
     ENDFOREACH()
 ENDMACRO(LINK_OSG_LIBRARY)
-LINK_OSG_LIBRARY(${PROJECT_NAME} osgDB osgUtil osgViewer osgGA osg )
+LINK_OSG_LIBRARY(${PROJECT_NAME} osgDB osgUtil osgViewer osgGA osg OpenThreads)
 
 # Debug/Release库后缀自动处理
 if(WIN32)
@@ -145,4 +145,11 @@ if(WIN32)
         RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin
     )
 endif()
- 
+
+# 自动复制shader文件到输出目录
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_SOURCE_DIR}/shader"
+    "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shader"
+    COMMENT "Copying shader files to output directory"
+)

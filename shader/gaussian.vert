@@ -3,6 +3,8 @@ layout (location = 0) in vec2 inPos;
 
 uniform samplerBuffer indexBuffer;
 uniform samplerBuffer dataBuffer;
+uniform samplerBuffer shBuffer;
+uniform bool hasSH;
 
 uniform mat4 view;
 uniform mat4 proj;
@@ -70,19 +72,19 @@ const float SH_C3[7] = float[7](          // 3阶
 
 // 根据视角方向 dir（归一化，从高斯点指向相机）和SH系数计算RGB颜色
 // dc.rgb = SH_C0 * f_dc + 0.5（CPU端已完成0阶转换），高阶部分在GPU叠加
-vec3 evalSphericalHarmonics(vec3 dir, vec4 dc, samplerBuffer buf, int base)
+vec3 evalSphericalHarmonics(vec3 dir, vec4 dc, int shBase)
 {
     float x = dir.x, y = dir.y, z = dir.z;
 
     // 0阶贡献已在CPU完成，直接作为基础色
     vec3 col = dc.rgb;
 
-    // 读取 1~3 阶 SH 系数（45个float = 12个Vec4f，存在 base+5 ~ base+16）
+    // 读取 1~3 阶 SH 系数（45个float = 12个Vec4f，从shBuffer读取）
     // 存储顺序: R(sh1..sh15), G(sh1..sh15), B(sh1..sh15)
     // 每个通道 15 个系数：1阶3个 + 2阶5个 + 3阶7个
     float sh[45];
     for (int i = 0; i < 12; ++i) {
-        vec4 v = texelFetch(buf, base + 5 + i);
+        vec4 v = texelFetch(shBuffer, shBase + i);
         int idx = i * 4;
         if (idx + 0 < 45) sh[idx + 0] = v.x;
         if (idx + 1 < 45) sh[idx + 1] = v.y;
@@ -146,7 +148,7 @@ vec3 evalSphericalHarmonics(vec3 dir, vec4 dc, samplerBuffer buf, int base)
 
 void main()
 {
-	int instanceAddress = int(texelFetch(indexBuffer,gl_InstanceID).x)*17;
+	int instanceAddress = int(texelFetch(indexBuffer,gl_InstanceID).x)*5;
 	vec4 pos      = texelFetch(dataBuffer, instanceAddress+0);
 	vec4 color    = texelFetch(dataBuffer, instanceAddress+1);
 	vec3 sigma10  = texelFetch(dataBuffer, instanceAddress+2).xyz;
@@ -177,14 +179,9 @@ void main()
     vec2 b2 = bases.zw;
 
     // 计算视角方向（世界空间，从高斯点指向相机，归一化）
-    // view矩阵最后一列（列主序）的xyz是相机在世界空间的位置（的负值的旋转部分），
-    // 更直接的做法：相机位置 = -transpose(mat3(view)) * view[3].xyz
     mat3 viewRot = mat3(view);
     vec3 camPos = -transpose(viewRot) * vec3(view[3].x, view[3].y, view[3].z);
     vec3 dir = normalize(camPos - pos.xyz);
-
-    // 用球谐函数计算视角相关颜色
-    vec3 shColor = evalSphericalHarmonics(dir, color, dataBuffer, instanceAddress);
 
     //position in screen space
     vec4 pos2d = proj * u;
@@ -196,7 +193,13 @@ void main()
         -1,1 );
     gl_Position.z = pos2d.z / pos2d.w;
 
-//	PassColor    = color;
-	PassColor    = vec4(shColor, color.a);
+    // 用球谐函数计算视角相关颜色（仅当hasSH时）
+    if (hasSH) {
+        int shBase = int(texelFetch(indexBuffer, gl_InstanceID).x) * 12;  // 使用排序后的索引
+        vec3 shColor = evalSphericalHarmonics(dir, color, shBase);
+        PassColor = vec4(shColor, color.a);
+    } else {
+        PassColor = color;
+    }
     PassPosition = inPos;
 };
