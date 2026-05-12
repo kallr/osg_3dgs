@@ -1,68 +1,97 @@
- 
-#ifndef BATCHOBJ_MANAGER_H
-#define BATCHOBJ_MANAGER_H
+#ifndef GAUSSIAN_DRAW_OBJ_H
+#define GAUSSIAN_DRAW_OBJ_H
 
-#include "osg\Matrixf"
-#include "osg\BoundingBox"
-#include "osg\Node"
-#include "osg\Group"
-#include "osg\matrixTransform"
- 
+#include "osg/Matrixf"
+#include "osg/BoundingBox"
+#include "osg/Node"
+#include "osg/Group"
+#include "osg/MatrixTransform"
+#include "osg/Image"
 
-//gaussian point
+#include <vector>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+
 struct MI_GaussianPoint {
-	osg::Vec3f position; //position
-	osg::Vec4f color;    //color, rgba (DC项基础色，rgba)
-
-	//协方差矩阵
-	osg::Vec4f sigma1;
-	osg::Vec4f sigma2;
-	osg::Vec4f sigma3;
-
-	// 球谐系数 1~3阶，RGB各15个，共45个 (f_rest_0 ~ f_rest_44)
-	// 布局: [R1,R2,...,R15, G1,...,G15, B1,...,B15]
-	float sh[45] = {};
+	osg::Vec3f position;
+	osg::Vec4f color;      // DC color (rgba), alpha = sigmoid(opacity)
+	osg::Vec3f scale;      // log-space scale (already exponentiated for .splat)
+	osg::Vec4f rotation;   // quaternion (x, y, z, w)
+	float sh[45] = {};     // 1~3 order SH coefficients
 };
 
-//gaussian draw obj
-class  GaussianDrawObj
+class GaussianSortThread
+{
+public:
+	GaussianSortThread();
+	~GaussianSortThread();
+
+	void start();
+	void stop();
+
+	void setPositions(const std::vector<MI_GaussianPoint>* points, int numPoints);
+	void requestSort(const osg::Matrix& modelView);
+	bool fetchResult(std::vector<int>& outIndices);
+
+private:
+	void run();
+
+	std::thread _thread;
+	std::mutex _taskMutex;
+	std::mutex _resultMutex;
+	std::atomic<bool> _running{false};
+	std::atomic<bool> _hasTask{false};
+	std::atomic<bool> _hasResult{false};
+
+	const std::vector<MI_GaussianPoint>* _points = nullptr;
+	int _numPoints = 0;
+	osg::Matrix _taskModelView;
+
+	std::vector<int> _resultIndices;
+};
+
+class GaussianDrawObj
 {
 public:
 	GaussianDrawObj(const std::string& name);
 	~GaussianDrawObj();
- 
-	bool getDirty();
-	void setDirty(bool flag);
- 
-	//return osg node
-	osg::ref_ptr<osg::Node> getNode(); 
-	//sort
-	void runSortAndUpdate(const osg::Matrix& viewProj, osg::Image* paramsImage);
+
+	osg::ref_ptr<osg::Node> getNode();
+
+	void requestSort();
+	bool applySortResult(osg::Image* indexImage);
+	bool shouldSort(const osg::Matrix& currentView);
+
+	int getNumPoints() const { return nNum; }
+	const std::vector<MI_GaussianPoint>& getPoints() const { return gaussianPoints; }
+	const osg::BoundingBox& getBounds() const { return bounds; }
+
 private:
-	void updateImage(osg::Image* paramsImage);
+	void updateDataImage(osg::Image* paramsImage);
 	void updateSHImage(osg::Image* paramsImage);
-	void loadShader(osg::StateSet* ss);
 	void updateIndexImage(osg::Image* paramsImage);
+	void loadShader(osg::StateSet* ss);
 
 	std::vector<MI_GaussianPoint> readSplatFile(const std::string& filename);
-	std::vector<MI_GaussianPoint> readFlyFile(const std::string& filename);
+	std::vector<MI_GaussianPoint> readPlyFile(const std::string& filename);
 	osg::ref_ptr<osg::Geometry> createQuadGeometry();
+
 private:
-	bool bDirty = false;
-	bool bInit=false;
-	bool flag = false;
-	bool hasSH = false;
 	int nNum = 0;
-	std::vector< MI_GaussianPoint> gaussianPoints;
+	bool hasSH = false;
+	std::vector<MI_GaussianPoint> gaussianPoints;
 	std::vector<int> depthIndex;
-	std::vector<size_t> distances;
 	osg::BoundingBox bounds;
+
+	osg::Matrix _lastViewMatrix;
+	bool _firstSort = true;
+
+	GaussianSortThread _sortThread;
 };
 
 void setMainCamera(osg::Camera* pC);
 osg::Camera* getCamera();
 
 #endif
-
-
-  

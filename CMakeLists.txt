@@ -64,21 +64,18 @@ ELSE(OSG_ROOT)
 ENDIF(OSG_ROOT)
 
 
-FIND_PATH(GLM_DIR 
+FIND_PATH(GLM_DIR
     NAMES glm/glm.hpp
     HINTS ${PROJECT_SOURCE_DIR}/vac/util ${PROJECT_SOURCE_DIR}/app1
 )
 
-find_path(GLM_DIR 
-    NAMES gather.h
-    HINTS ${PROJECT_SOURCE_DIR}/vac/util ${PROJECT_SOURCE_DIR}/app1
-)
+# GLM is no longer required (covariance computed on GPU)
+# Kept as optional for potential future use
  
 
 # include
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${GLM_DIR}
     ${OSG_INCLUDE_DIR}
     ${OSG_BUILD_INCLUDE_DIR}
 )

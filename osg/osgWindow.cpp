@@ -80,9 +80,9 @@ void GraphicsWindowQt::keyPressEvent(QKeyEvent *event)
 	osgGA::GUIEventAdapter::KeySymbol key = getKey(event->key(), event->text());
 	if ((int)key == 0) return;  // not recognized
 
-	//键盘c，进行高斯点云排序
-	if (event->text() == 'c' || event->text() == 'C')
-		pObj->setDirty(true);
+	// Force re-sort on 'C' key (sorting is also automatic per-frame)
+	if (pObj && (event->text() == 'c' || event->text() == 'C'))
+		pObj->requestSort();
 
 	if (event->modifiers() != Qt::NoModifier)
 	{

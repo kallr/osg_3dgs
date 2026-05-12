@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build
 
-**Dependencies:** Qt5 (Widgets, Core, Gui, OpenGL), OSG >= 3.6.5 (osg, osgDB, osgUtil, osgViewer, osgGA), GLM. Set `OSG_ROOT` and `GLM_DIR` environment variables if not in standard paths.
+**Dependencies:** Qt5 (Widgets, Core, Gui, OpenGL), OSG >= 3.6.5 (osg, osgDB, osgUtil, osgViewer, osgGA). Set `OSG_ROOT` environment variable if not in standard paths. GLM is no longer required.
 
 ```bash
 # Linux/macOS
@@ -26,34 +26,39 @@ No test framework. No linting/formatting configuration.
 ### Data Flow
 
 1. **Load:** `GraphicsWindowQt::loadModule()` branches on extension — `.splat`/`.ply` go to `GaussianDrawObj`, anything else to `osgDB::readNodeFile()`.
-2. **Parse:** `GaussianDrawObj::readSplatFile()` or `readFlyFile()` converts file data into `MI_GaussianPoint[]` (position + RGBA color + 3×3 covariance matrix stored as three `Vec4f` rows).
-3. **Scene setup (`getNode()`):** Creates one instanced quad geometry (4 vertices, drawn N times) and two Texture Buffer Objects (TBOs): `dataBuffer` (5 Vec4f per splat: pos, color, sigma1-3) and `indexBuffer` (sorted indices, one `int` per splat). Configures alpha blending (`DST_ALPHA/ONE` for RGB, `ZERO/ONE_MINUS_SRC_ALPHA` for alpha).
+2. **Parse:** `readSplatFile()` or `readPlyFile()` converts file data into `MI_GaussianPoint[]` (position + RGBA color + scale + quaternion + SH coefficients). Covariance is NOT precomputed on CPU — it's computed on the GPU.
+3. **Scene setup (`getNode()`):** Creates one instanced quad geometry (4 vertices as 2 triangles, drawn N times) and TBOs:
+   - `indexBuffer` (TBO unit 0): sorted indices
+   - `dataBuffer` (TBO unit 1): 4 Vec4f per splat (pos+alpha, scale+R, quat.xyz+G, quat.w+B)
+   - `shBuffer` (TBO unit 2, optional): 12 Vec4f per splat (45 SH coefficients)
+   Configures premultiplied alpha blending (`GL_ONE / GL_ONE_MINUS_SRC_ALPHA`).
 4. **Per-frame callbacks:**
+   - `GaussianSortCallback` (Camera pre-draw): detects view matrix changes, triggers background sort.
    - `SSCallback` (StateSet): uploads `view`, `proj`, `viewport_size` uniforms each frame.
-   - `BatchObjTextureCBEx` (on index TBO): checks `bDirty` flag and view direction change (dot-product threshold) → triggers CPU depth sort → uploads new sorted index buffer to TBO.
-5. **GPU render:** `gaussian.vert` reads sorted instance index from `indexBuffer` TBO, fetches splat data from `dataBuffer` TBO, projects the 3D covariance via Jacobian of perspective projection (`J * W * sigma * W^T * J^T`), decomposes 2D covariance into eigenvectors/eigenvalues to position quad vertices along the ellipse axes. `gaussian.frag` evaluates `exp(-dot(pos,pos))` Gaussian falloff and discards fragments beyond 2σ.
+   - `IndexBufferUpdateCallback` (on index TBO): applies sort results from background thread.
+5. **GPU render:** `gaussian.vert` computes 3D covariance from scale+quaternion on GPU (`R * S² * Rᵀ`), projects via Jacobian (`J * W * sigma * Wᵀ * Jᵀ`), computes ellipse extents from eigenvalues, positions quad vertices, and passes inverse 2D covariance to fragment shader. `gaussian.frag` evaluates `exp(-0.5 * dot(d, cov2Dinv * d))` and discards below alpha threshold.
 
 ### Key Files
 
 | File | Role |
 |------|------|
-| `osg/GaussianDrawObj.h/.cpp` | Core: file parsing, covariance construction, TBO setup, depth sort (counting sort with 65535 buckets), OSG callbacks |
+| `osg/GaussianDrawObj.h/.cpp` | Core: file parsing, TBO setup, background radix sort thread, OSG callbacks |
 | `osg/osgWindow.h/.cpp` | Qt↔OSG bridge: dual-inherits `QOpenGLWidget` + `osgViewer::Viewer`, translates Qt events to OSG, 50ms render timer |
-| `shader/gaussian.vert/.frag` | GLSL 4.30 — mathematical core of 3DGS (Jacobian projection, eigendecomposition, Gaussian evaluation) |
+| `shader/gaussian.vert/.frag` | GLSL 4.30 — GPU covariance computation, Jacobian projection, eigenvalue ellipse, inverse cov2D Gaussian evaluation |
 | `shader/point.vert/.frag` | Simpler fallback: renders splats as fixed-size `GL_POINTS` without Gaussian math |
 | `tools/miniply.h/.cpp` | Vendored MIT PLY parser (by Vilya Harvey) |
 | `mainwindow.cpp/.h` | Thin Qt shell: toolbar + `QFileDialog` → `loadModule()` |
 
-### Covariance Construction
+### Covariance Construction (GPU)
 
-Both file formats produce the same 3×3 covariance matrix `sigma = RS * (RS)^T` where:
-- **`.splat`:** rotation is decoded from 4 normalized `uint8` bytes (quaternion), scale is stored directly as `float[3]`.
-- **`.ply`:** scale properties (`scale_0..2`) are exponentiated (`exp(scale)`), rotation quaternion from `rot_0..3` properties. Colors from `f_dc_0..2` (spherical harmonics DC: multiply by `1/(2*sqrt(π)) ≈ 0.282` then shift by 0.5), opacity via sigmoid.
+Covariance is computed entirely on the GPU in the vertex shader:
+- `computeCovariance(scale, quat)` builds `R * S² * Rᵀ` from the stored scale vector and quaternion.
+- This saves CPU memory (4+4 floats vs 12 floats per splat) and eliminates CPU-GPU bandwidth for the covariance matrix.
 
 ### Depth Sort
 
-`runSortAndUpdate()` implements a counting sort (65535 buckets by distance² from camera position), producing a back-to-front order. Sort is triggered when `bDirty == true` **and** the view direction dot-product has changed beyond a threshold. User can force a re-sort by pressing **C**.
+`GaussianSortThread` runs a background radix sort (8-bit, 4-pass LSB radix sort on float-as-uint32 depth keys). Sorting is triggered automatically when the view matrix changes. The sort produces back-to-front ordering. User can also force a re-sort by pressing **C**.
 
 ### Camera / Navigation
 
-`TrackballManipulator` handles mouse-based orbit/zoom. `fullScreen()` auto-fits camera to scene bounding box via `osg::ComputeBoundsVisitor`. A global `osg::Camera*` pointer (`g_pCamera` in `osgWindow.cpp`) is used by `GaussianDrawObj` callbacks to read the current view/projection matrices.
+`TrackballManipulator` handles mouse-based orbit/zoom. `fullScreen()` auto-fits camera to scene bounding box via `osg::ComputeBoundsVisitor`. A global `osg::Camera*` pointer is used by callbacks to read the current view/projection matrices.

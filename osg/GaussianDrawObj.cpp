@@ -1,11 +1,9 @@
-
 #include "GaussianDrawObj.h"
 
 #include "osg/Material"
 #include "osg/Geode"
 #include "osg/Geometry"
 #include "osg/TextureBuffer"
-#include "osg/MatrixTransform" 
 #include "osg/MatrixTransform"
 #include "osgUtil/CullVisitor"
 #include "osg/ComputeBoundsVisitor"
@@ -13,334 +11,396 @@
 #include <osg/BlendFunc>
 #include <osg/BlendEquation>
 #include "tools/miniply.h"
-
 #include "tools/tools.h"
 
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+#include <fstream>
+#include <iostream>
 
-#include <glm/common.hpp>
+// ======================== GaussianSortThread ========================
 
-#define GLM_ENABLE_EXPERIMENTAL  // waow
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/quaternion.hpp>
-#include <glm/gtx/string_cast.hpp>
+GaussianSortThread::GaussianSortThread() {}
 
+GaussianSortThread::~GaussianSortThread() { stop(); }
+
+void GaussianSortThread::start()
+{
+	_running = true;
+	_thread = std::thread(&GaussianSortThread::run, this);
+}
+
+void GaussianSortThread::stop()
+{
+	_running = false;
+	if (_thread.joinable())
+		_thread.join();
+}
+
+void GaussianSortThread::requestSort(const osg::Matrix& modelView)
+{
+	std::lock_guard<std::mutex> lock(_taskMutex);
+	_taskModelView = modelView;
+	_hasTask = true;
+}
+
+void GaussianSortThread::setPositions(const std::vector<MI_GaussianPoint>* points, int numPoints)
+{
+	_points = points;
+	_numPoints = numPoints;
+}
+
+bool GaussianSortThread::fetchResult(std::vector<int>& outIndices)
+{
+	if (!_hasResult) return false;
+	std::lock_guard<std::mutex> lock(_resultMutex);
+	outIndices.swap(_resultIndices);
+	_hasResult = false;
+	return true;
+}
+
+void GaussianSortThread::run()
+{
+	while (_running)
+	{
+		if (!_hasTask)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			continue;
+		}
+
+		osg::Matrix localMV;
+		int localNum;
+		{
+			std::lock_guard<std::mutex> lock(_taskMutex);
+			localMV = _taskModelView;
+			localNum = _numPoints;
+			_hasTask = false;
+		}
+
+		if (!_points || localNum <= 0) continue;
+
+		// Radix sort by reinterpreting float depth as uint32
+		std::vector<uint32_t> keys(localNum);
+		std::vector<int> values(localNum);
+
+		for (int i = 0; i < localNum; ++i)
+		{
+			const osg::Vec3f& p = (*_points)[i].position;
+			float ez = (float)(p.x() * localMV(0, 2) + p.y() * localMV(1, 2) +
+			                    p.z() * localMV(2, 2) + localMV(3, 2));
+			// Flip sign for correct ordering
+			float d = (ez > 0.0f) ? 0.0f : -ez;
+			union { float f; uint32_t u; } un;
+			un.f = d;
+			keys[i] = un.u;
+			values[i] = i;
+		}
+
+		// 8-bit radix sort (4 passes for 32-bit keys)
+		const int RADIX_BITS = 8;
+		const int RADIX_SIZE = 1 << RADIX_BITS;
+		const int RADIX_MASK = RADIX_SIZE - 1;
+
+		std::vector<uint32_t> tempKeys(localNum);
+		std::vector<int> tempValues(localNum);
+
+		for (int pass = 0; pass < 4; ++pass)
+		{
+			int shift = pass * RADIX_BITS;
+			std::vector<int> count(RADIX_SIZE, 0);
+
+			for (int i = 0; i < localNum; ++i)
+				++count[(keys[i] >> shift) & RADIX_MASK];
+
+			for (int i = 1; i < RADIX_SIZE; ++i)
+				count[i] += count[i - 1];
+
+			for (int i = localNum - 1; i >= 0; --i)
+			{
+				int bucket = (keys[i] >> shift) & RADIX_MASK;
+				int dest = --count[bucket];
+				tempKeys[dest] = keys[i];
+				tempValues[dest] = values[i];
+			}
+
+			keys.swap(tempKeys);
+			values.swap(tempValues);
+		}
+
+		// Reverse for back-to-front ordering
+		std::vector<int> sorted(localNum);
+		for (int i = 0; i < localNum; ++i)
+			sorted[i] = values[localNum - 1 - i];
+
+		{
+			std::lock_guard<std::mutex> lock(_resultMutex);
+			_resultIndices.swap(sorted);
+			_hasResult = true;
+		}
+	}
+}
+
+// ======================== Callbacks ========================
+
+class GaussianSortCallback : public osg::Camera::DrawCallback
+{
+public:
+	GaussianSortCallback(GaussianDrawObj* obj) : _obj(obj) {}
+
+	virtual void operator()(osg::RenderInfo& renderInfo) const
+	{
+		if (!_obj || !renderInfo.getCurrentCamera()) return;
+		osg::Matrix viewMatrix = renderInfo.getCurrentCamera()->getViewMatrix();
+
+		if (_obj->shouldSort(viewMatrix))
+			_obj->requestSort();
+	}
+
+private:
+	GaussianDrawObj* _obj;
+};
 
 class SSCallback : public osg::StateSet::Callback
 {
 public:
-	SSCallback(GaussianDrawObj* pBatchObj)
-	{
-		pBatchObj_ = pBatchObj;
-	}
+	SSCallback(GaussianDrawObj* obj) : _obj(obj) {}
+
 	virtual void operator()(osg::StateSet* ss, osg::NodeVisitor* nv)
 	{
-		osg::StateSet* stateSet = dynamic_cast<osg::StateSet*>(ss);
-		if (stateSet)
-		{
-			osg::Camera* camera = getCamera();
-			if (camera)
-			{
-				osg::Matrixf viewMatrix = camera->getViewMatrix();
-				ss->getOrCreateUniform("view", osg::Uniform::FLOAT_MAT4)->set(viewMatrix);
+		if (!ss) return;
+		osg::Camera* camera = getCamera();
+		if (!camera) return;
 
-				osg::Matrixf projMatrix = camera->getProjectionMatrix();
-				ss->getOrCreateUniform("proj", osg::Uniform::FLOAT_MAT4)->set(projMatrix);
+		osg::Matrixf viewMatrix = camera->getViewMatrix();
+		ss->getOrCreateUniform("view", osg::Uniform::FLOAT_MAT4)->set(viewMatrix);
 
-				osg::Vec2 vs;
-				vs[0] = camera->getViewport()->width();
-				vs[1] = camera->getViewport()->height();
-				ss->getOrCreateUniform("viewport_size", osg::Uniform::FLOAT_VEC2)->set(vs);
-			}
-		}
-	}
-	GaussianDrawObj* pBatchObj_ = nullptr;
-};
+		osg::Matrixf projMatrix = camera->getProjectionMatrix();
+		ss->getOrCreateUniform("proj", osg::Uniform::FLOAT_MAT4)->set(projMatrix);
 
-
-//updae index iamge
-class BatchObjTextureCBEx : public osg::StateAttributeCallback
-{
-public:
-	BatchObjTextureCBEx(GaussianDrawObj* pBatchObj)
-	{
-		pBatchObj_ = pBatchObj;
-	}
-
-	virtual void operator()(osg::StateAttribute* ss, osg::NodeVisitor* nv)
-	{ 
-		if (!pBatchObj_)return;
-
-		if (pBatchObj_->getDirty() )
-		{
-			pBatchObj_->setDirty(false);
-
-			osg::ref_ptr<osg::TextureBuffer> tbo = dynamic_cast<osg::TextureBuffer*>(ss);
-			osg::Image* indexImage = tbo->getImage();
-			if (!indexImage)
-				return;
-
-
-			osg::Matrixd curViewMat = getCamera()->getProjectionMatrix()* getCamera()->getViewMatrix();
-
-			double  dot =
-				viewMatrix(0, 2) * curViewMat(0, 2) +
-				viewMatrix(1, 2) * curViewMat(1, 2) +
-				viewMatrix(2, 2) * curViewMat(2, 2);
-
-			if (abs(dot - 1) < 0.01) {
-				return;
-			}
-
-			viewMatrix = curViewMat;
-			pBatchObj_->runSortAndUpdate(viewMatrix,indexImage);
-		}
+		osg::Vec2 vs;
+		vs[0] = camera->getViewport()->width();
+		vs[1] = camera->getViewport()->height();
+		ss->getOrCreateUniform("viewport_size", osg::Uniform::FLOAT_VEC2)->set(vs);
 	}
 
 private:
-	GaussianDrawObj* pBatchObj_ = nullptr;
-	int nCount = 0;
-	osg::Matrixd viewMatrix;
+	GaussianDrawObj* _obj;
 };
 
+class IndexBufferUpdateCallback : public osg::StateAttributeCallback
+{
+public:
+	IndexBufferUpdateCallback(GaussianDrawObj* obj) : _obj(obj) {}
+
+	virtual void operator()(osg::StateAttribute* sa, osg::NodeVisitor* nv)
+	{
+		if (!_obj) return;
+		osg::TextureBuffer* tbo = dynamic_cast<osg::TextureBuffer*>(sa);
+		if (!tbo) return;
+		osg::Image* indexImage = tbo->getImage();
+		if (!indexImage) return;
+
+		_obj->applySortResult(indexImage);
+	}
+
+private:
+	GaussianDrawObj* _obj;
+};
+
+// ======================== GaussianDrawObj ========================
+
 GaussianDrawObj::GaussianDrawObj(const std::string& name)
-{  
-	if (name.find(".ply") != -1)
-		gaussianPoints = readFlyFile(name);
-	else if (name.find(".splat"))
+{
+	if (name.find(".ply") != std::string::npos)
+		gaussianPoints = readPlyFile(name);
+	else if (name.find(".splat") != std::string::npos)
 		gaussianPoints = readSplatFile(name);
 
-	nNum = gaussianPoints.size();
-
-	distances.resize(nNum );
+	nNum = (int)gaussianPoints.size();
 	depthIndex.resize(nNum);
+	std::iota(depthIndex.begin(), depthIndex.end(), 0);
 
-	for (int i = 0; i < nNum; i++)
-		depthIndex[i] = i;
+	_sortThread.setPositions(&gaussianPoints, nNum);
+	_sortThread.start();
 }
 
 GaussianDrawObj::~GaussianDrawObj()
 {
-
+	_sortThread.stop();
 }
 
-bool GaussianDrawObj::getDirty()
+bool GaussianDrawObj::shouldSort(const osg::Matrix& currentView)
 {
-	return bDirty;
+	if (_firstSort) return true;
+
+	// Compare view matrices — skip sort if camera hasn't moved
+	for (int i = 0; i < 4; ++i)
+		for (int j = 0; j < 4; ++j)
+			if (std::abs(_lastViewMatrix(i, j) - currentView(i, j)) > 1e-5)
+				return true;
+	return false;
 }
-void  GaussianDrawObj::setDirty(bool flag)
+
+void GaussianDrawObj::requestSort()
 {
-	bDirty = flag;
+	osg::Camera* cam = getCamera();
+	if (!cam) return;
+
+	osg::Matrix viewMatrix = cam->getViewMatrix();
+	_lastViewMatrix = viewMatrix;
+	_firstSort = false;
+
+	_sortThread.requestSort(viewMatrix);
 }
 
-
-//高斯点排序
-void GaussianDrawObj::runSortAndUpdate(const osg::Matrix& viewProj,osg::Image* paramsImage)
-{ 
-	osg::Vec3f cam_pos;
-	osg::Vec3f center;
-	osg::Vec3f up;
-	getCamera()->getViewMatrixAsLookAt(cam_pos, center, up);
-
-	// 65535 是一个常见的桶数量，它可以覆盖大多数的距离范围，
-	const size_t n_buckets = 65535;
-	std::vector<size_t> count(n_buckets + 1, 0); 
-  
-	std::vector<int> output(nNum, 0);
-
-	float max_dist = 1.2f *2 * bounds.radius();
-	max_dist *= max_dist;
-
-	size_t num_gaussians = gaussianPoints.size();
-
- 	for (int i = 0; i< num_gaussians; i++)
-	{
-		const auto& g = gaussianPoints[i];
-		auto v = g.position-cam_pos ;
-		float d = v.x() * v.x() + v.y() * v.y() + v.z() * v.z();  // dot product
-		float d_normalized = n_buckets * d / max_dist;  // between 0 and n_buckets
-		size_t d_int = std::min(d_normalized, (float)n_buckets - 1);
-		++count[d_int];
-		distances[i]=d_int;
-	}
-
-	for (int i = 1; i < count.size(); ++i) {
-		count[i] = count[i] + count[i - 1];
-	}
-
-	for (int i = num_gaussians - 1; i >= 0; --i)
-	{
-		size_t j = distances[i];
-		--count[j];
-		output[count[j]] = i;
-	}
-	std::swap(output, depthIndex);
-	updateIndexImage(paramsImage);
-}
-
-  
-void GaussianDrawObj::updateImage(osg::Image* paramsImage)
+bool GaussianDrawObj::applySortResult(osg::Image* indexImage)
 {
-	// 每个高斯点占5个Vec4f：
-	//   [0] pos, [1] color, [2-4] sigma
-	const int stride = 5;
-	for(int i = 0; i< nNum; i++)
+	std::vector<int> newIndices;
+	if (!_sortThread.fetchResult(newIndices))
+		return false;
+
+	depthIndex.swap(newIndices);
+	updateIndexImage(indexImage);
+	return true;
+}
+
+void GaussianDrawObj::updateDataImage(osg::Image* paramsImage)
+{
+	// Per-splat data: 4 Vec4f
+	//   [0] position.xyz + alpha
+	//   [1] scale.xyz + color.r
+	//   [2] rotation.xyz + color.g
+	//   [3] rotation.w + 0 + 0 + color.b
+	const int stride = 4;
+	for (int i = 0; i < nNum; i++)
 	{
-		const MI_GaussianPoint& gsPos = gaussianPoints[i];
+		const MI_GaussianPoint& g = gaussianPoints[i];
 		osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(stride * i);
-		if(ptr)
-		{
-			ptr[0].set(gsPos.position[0], gsPos.position[1], gsPos.position[2], 1);
-			ptr[1] = gsPos.color;
-			ptr[2] = gsPos.sigma1;
-			ptr[3] = gsPos.sigma2;
-			ptr[4] = gsPos.sigma3;
-		}
- 	}
+		if (!ptr) continue;
+
+		ptr[0].set(g.position.x(), g.position.y(), g.position.z(), g.color.a());
+		ptr[1].set(g.scale.x(), g.scale.y(), g.scale.z(), g.color.r());
+		ptr[2].set(g.rotation.x(), g.rotation.y(), g.rotation.z(), g.color.g());
+		ptr[3].set(g.rotation.w(), 0.0f, 0.0f, g.color.b());
+	}
 	paramsImage->dirty();
 }
 
 void GaussianDrawObj::updateSHImage(osg::Image* paramsImage)
 {
-	// 每个高斯点的SH系数占12个Vec4f（45个float + 3个padding = 48个float = 12个Vec4f）
-	// 存储顺序: R(sh1..sh15), G(sh1..sh15), B(sh1..sh15)
 	const int shStride = 12;
-	for(int i = 0; i< nNum; i++)
+	for (int i = 0; i < nNum; i++)
 	{
-		const MI_GaussianPoint& gsPos = gaussianPoints[i];
+		const MI_GaussianPoint& g = gaussianPoints[i];
 		osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(shStride * i);
-		if(ptr)
-		{
-			float* shPtr = (float*)ptr;
-			for (int k = 0; k < 45; ++k)
-				shPtr[k] = gsPos.sh[k];
-			// padding
-			shPtr[45] = shPtr[46] = shPtr[47] = 0.0f;
-		}
+		if (!ptr) continue;
+
+		float* shPtr = (float*)ptr;
+		for (int k = 0; k < 45; ++k)
+			shPtr[k] = g.sh[k];
+		shPtr[45] = shPtr[46] = shPtr[47] = 0.0f;
 	}
 	paramsImage->dirty();
 }
 
 void GaussianDrawObj::updateIndexImage(osg::Image* paramsImage)
 {
-	int num = depthIndex.size();
-
-	osg::Vec4f* ptr0 = (osg::Vec4f*)paramsImage->data(0);
-
- 	for (int i = 0; i< num ;i++ )
+	osg::Vec4f* ptr = (osg::Vec4f*)paramsImage->data(0);
+	for (int i = 0; i < nNum; i++)
 	{
- 		ptr0->set(depthIndex[i],0,0,0 );
-		ptr0++;
+		ptr->set((float)depthIndex[i], 0, 0, 0);
+		ptr++;
 	}
-
 	paramsImage->dirty();
 }
 
-
 void GaussianDrawObj::loadShader(osg::StateSet* ss)
 {
-	osg::ref_ptr<osg::Program> gsProgram = new osg::Program;
-	if(gsProgram)
-	{
-		std::string strDir = osg_tools::getAppDir()  +  "\\shader\\";
-		osg::Shader* vertex_shader = osgDB::readShaderFile(  osg::Shader::VERTEX,   strDir + "gaussian.vert");
-		osg::Shader* fragment_shader = osgDB::readShaderFile(osg::Shader::FRAGMENT, strDir + "gaussian.frag");
-		gsProgram->addShader(vertex_shader);
-		gsProgram->addShader(fragment_shader);
-	}
- 	ss->setAttribute(gsProgram);
+	osg::ref_ptr<osg::Program> program = new osg::Program;
+	std::string strDir = osg_tools::getAppDir() + "\\shader\\";
+	osg::Shader* vs = osgDB::readShaderFile(osg::Shader::VERTEX, strDir + "gaussian.vert");
+	osg::Shader* fs = osgDB::readShaderFile(osg::Shader::FRAGMENT, strDir + "gaussian.frag");
+	if (vs) program->addShader(vs);
+	if (fs) program->addShader(fs);
+	ss->setAttribute(program);
 }
 
- 
 osg::ref_ptr<osg::Node> GaussianDrawObj::getNode()
 {
 	osg::ref_ptr<osg::Geode> geode = new osg::Geode;
-
 	osg::ref_ptr<osg::Geometry> pInstance = createQuadGeometry();
 	geode->addChild(pInstance);
 
-	//index buffer
+	// Index buffer TBO
 	{
-		osg::ref_ptr<osg::Image> paramsImage = new osg::Image;
-		int transPos = nNum;
-		paramsImage->allocateImage(transPos, 1, 1, GL_RGBA, GL_FLOAT);
-		updateIndexImage(paramsImage);
+		osg::ref_ptr<osg::Image> indexImg = new osg::Image;
+		indexImg->allocateImage(nNum, 1, 1, GL_RGBA, GL_FLOAT);
+		updateIndexImage(indexImg);
 
 		osg::ref_ptr<osg::TextureBuffer> tbo = new osg::TextureBuffer;
-		tbo->setImage(paramsImage.get());
+		tbo->setImage(indexImg.get());
 		tbo->setInternalFormat(GL_RGBA32F_ARB);
 		pInstance->getOrCreateStateSet()->setTextureAttribute(0, tbo.get());
-		tbo->setUpdateCallback(new BatchObjTextureCBEx(this));
+		tbo->setUpdateCallback(new IndexBufferUpdateCallback(this));
 	}
 
-	//data buffer
+	// Data buffer TBO (4 Vec4f per splat: pos+alpha, scale+r, quat.xyz+g, quat.w+b)
 	{
-		osg::ref_ptr<osg::Image> paramsImage = new osg::Image;
-		int transPos = 5 * nNum;  // 每点5个Vec4f：pos + color + sigma1-3
-		paramsImage->allocateImage(transPos, 1, 1, GL_RGBA, GL_FLOAT);
-		updateImage(paramsImage);
+		osg::ref_ptr<osg::Image> dataImg = new osg::Image;
+		dataImg->allocateImage(4 * nNum, 1, 1, GL_RGBA, GL_FLOAT);
+		updateDataImage(dataImg);
 
 		osg::ref_ptr<osg::TextureBuffer> tbo = new osg::TextureBuffer;
-		tbo->setImage(paramsImage.get());
+		tbo->setImage(dataImg.get());
 		tbo->setInternalFormat(GL_RGBA32F_ARB);
 		pInstance->getOrCreateStateSet()->setTextureAttribute(1, tbo.get());
 	}
 
-	//sh buffer (separate TBO for spherical harmonics)
+	// SH buffer TBO
 	if (hasSH)
 	{
-		osg::ref_ptr<osg::Image> shImage = new osg::Image;
-		int shTransPos = 12 * nNum;  // 每点12个Vec4f（45个SH float + 3个padding）
-		shImage->allocateImage(shTransPos, 1, 1, GL_RGBA, GL_FLOAT);
-		updateSHImage(shImage);
+		osg::ref_ptr<osg::Image> shImg = new osg::Image;
+		shImg->allocateImage(12 * nNum, 1, 1, GL_RGBA, GL_FLOAT);
+		updateSHImage(shImg);
 
-		osg::ref_ptr<osg::TextureBuffer> shTbo = new osg::TextureBuffer;
-		shTbo->setImage(shImage.get());
-		shTbo->setInternalFormat(GL_RGBA32F_ARB);
-		pInstance->getOrCreateStateSet()->setTextureAttribute(2, shTbo.get());
+		osg::ref_ptr<osg::TextureBuffer> tbo = new osg::TextureBuffer;
+		tbo->setImage(shImg.get());
+		tbo->setInternalFormat(GL_RGBA32F_ARB);
+		pInstance->getOrCreateStateSet()->setTextureAttribute(2, tbo.get());
 	}
 
-	//ss
-	osg::StateSet* stateset = pInstance->getOrCreateStateSet();
-	if (stateset)
-	{
-		loadShader(stateset);
-		stateset->setUpdateCallback(new SSCallback(this));
+	// State setup
+	osg::StateSet* ss = pInstance->getOrCreateStateSet();
+	loadShader(ss);
+	ss->setUpdateCallback(new SSCallback(this));
 
-		osg::Uniform* indexBufferSampler = new osg::Uniform("indexBuffer", int(0));
-		stateset->addUniform(indexBufferSampler);
+	ss->addUniform(new osg::Uniform("indexBuffer", 0));
+	ss->addUniform(new osg::Uniform("dataBuffer", 1));
+	ss->addUniform(new osg::Uniform("shBuffer", 2));
+	ss->addUniform(new osg::Uniform("hasSH", hasSH));
 
-		osg::Uniform* dataBufferSampler = new osg::Uniform("dataBuffer", int(1));
-		stateset->addUniform(dataBufferSampler);
+	// Disable depth test/write
+	ss->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
 
-		osg::Uniform* shBufferSampler = new osg::Uniform("shBuffer", int(2));
-		stateset->addUniform(shBufferSampler);
+	// Premultiplied alpha blending: GL_ONE, GL_ONE_MINUS_SRC_ALPHA
+	ss->setMode(GL_BLEND, osg::StateAttribute::ON);
+	osg::ref_ptr<osg::BlendFunc> blendFunc = new osg::BlendFunc;
+	blendFunc->setFunction(osg::BlendFunc::ONE, osg::BlendFunc::ONE_MINUS_SRC_ALPHA);
+	ss->setAttributeAndModes(blendFunc, osg::StateAttribute::ON);
 
-		osg::Uniform* hasSHUniform = new osg::Uniform("hasSH", hasSH);
-		stateset->addUniform(hasSHUniform);
-
-
-		//禁用深度测试
-		stateset->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
-
-		//启动混合
-		stateset->setMode(GL_BLEND, osg::StateAttribute::ON);
-		//设置混合方程和混合因子
-		osg::ref_ptr<osg::BlendFunc> blendFunc = new osg::BlendFunc();
-		blendFunc->setFunction(
-			osg::BlendFunc::DST_ALPHA, osg::BlendFunc::ONE, // RGB
-			osg::BlendFunc::ZERO, osg::BlendFunc::ONE_MINUS_SRC_ALPHA  // Alpha
-		);
-
-		stateset->setAttributeAndModes(blendFunc, osg::StateAttribute::ON);
-	}
+	// Register pre-draw callback for automatic sorting
+	osg::Camera* cam = getCamera();
+	if (cam)
+		cam->setPreDrawCallback(new GaussianSortCallback(this));
 
 	return geode;
 }
 
 std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& filename)
 {
- 	std::vector<MI_GaussianPoint> points;
-
+	std::vector<MI_GaussianPoint> points;
 	std::ifstream file(filename, std::ios::binary);
 	if (!file)
 	{
@@ -348,88 +408,58 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readSplatFile(const std::string& 
 		return points;
 	}
 
-
-	//高斯点结构体  
 	struct Splat {
-		float pos[3];      // 位置R3 (x,   y,  z)
-		float scale[3];    // 缩放系数R3(sx, sy, sz)
-		uint8_t color[4];  // 颜色R4(r,   g,  b,a)
-		uint8_t rot[4];    // 旋转4元数R4(w, x, y, z)
+		float pos[3];
+		float scale[3];
+		uint8_t color[4];
+		uint8_t rot[4];
 	};
 
 	Splat splat;
 	while (file.read(reinterpret_cast<char*>(&splat), sizeof(Splat)))
 	{
-		MI_GaussianPoint point;
-		point.position.set(splat.pos[0], splat.pos[1], splat.pos[2]);
+		MI_GaussianPoint g;
+		g.position.set(splat.pos[0], splat.pos[1], splat.pos[2]);
 
-		// 颜色值范围是0-255，需要转换到0-1
-		point.color.set(splat.color[0], splat.color[1], splat.color[2], splat.color[3]);
-		point.color /= 255.0;
+		g.color.set(splat.color[0] / 255.0f, splat.color[1] / 255.0f,
+		            splat.color[2] / 255.0f, splat.color[3] / 255.0f);
 
-		glm::vec3 scale = {
-						splat.scale[0],
-						splat.scale[1],
-						splat.scale[2]
-		};
+		// Store raw scale (already in linear space for .splat format)
+		g.scale.set(splat.scale[0], splat.scale[1], splat.scale[2]);
 
-		glm::mat4 scale_mat = glm::scale(glm::mat4(1.0f), scale);
+		// Decode quaternion from uint8
+		float rx = (splat.rot[0] - 128.0f) / 128.0f;
+		float ry = (splat.rot[1] - 128.0f) / 128.0f;
+		float rz = (splat.rot[2] - 128.0f) / 128.0f;
+		float rw = (splat.rot[3] - 128.0f) / 128.0f;
 
-		// 旋转值范围是-128-127，需要转换到-1-1
-		float rx = (1.0 * splat.rot[0] - 128.0) / 128.0;
-		float ry = (1.0 * splat.rot[1] - 128.0) / 128.0;
-		float rz = (1.0 * splat.rot[2] - 128.0) / 128.0;
-		float rw = (1.0 * splat.rot[3] - 128.0) / 128.0;
+		// Normalize quaternion
+		float len = std::sqrt(rx * rx + ry * ry + rz * rz + rw * rw);
+		if (len > 0.0f) { rx /= len; ry /= len; rz /= len; rw /= len; }
+		g.rotation.set(rx, ry, rz, rw);
 
-		glm::quat rot = { rx,ry,rz,rw };
-
-		glm::mat4 rot_mat = glm::mat4(glm::mat3(rot));
-
-		// 计算协方差矩阵
-		auto rot_scale = rot_mat * scale_mat;
-		glm::mat4 sigma = rot_scale * glm::transpose(rot_scale);
-
-		point.sigma1 = osg::Vec4f(sigma[0][0], sigma[0][1], sigma[0][2], sigma[0][3]);
-		point.sigma2 = osg::Vec4f(sigma[1][0], sigma[1][1], sigma[1][2], sigma[1][3]);
-		point.sigma3 = osg::Vec4f(sigma[2][0], sigma[2][1], sigma[2][2], sigma[2][3]);
-
-		// 计算边界
-		bounds.expandBy(point.position);
-
-		points.push_back(point);
+		bounds.expandBy(g.position);
+		points.push_back(g);
 	}
 
-	std::cout << "Loaded " << points.size() << " Gaussian points" << std::endl;
-	return points; 
+	std::cout << "Loaded " << points.size() << " Gaussian points from .splat" << std::endl;
+	return points;
 }
 
-
-std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& ply_path)
+std::vector<MI_GaussianPoint> GaussianDrawObj::readPlyFile(const std::string& ply_path)
 {
 	std::vector<MI_GaussianPoint> points;
 
-	// 定义常量，计算球谐系数
+	const float SH_C0 = 0.28209479177387814f;
 
- 	const float SH_0 = 0.28209479177387814f;
-	// 基础属性：位置、DC颜色、不透明度、缩放、旋转
 	const std::vector<std::string> properties = {
-	"x",       // 0
-	"y",       // 1
-	"z",       // 2
-	"f_dc_0",  // 3
-	"f_dc_1",  // 4
-	"f_dc_2",  // 5
-	"opacity", // 6
-	"scale_0", // 7
-	"scale_1", // 8
-	"scale_2", // 9
-	"rot_0",   // 10
-	"rot_1",   // 11
-	"rot_2",   // 12
-	"rot_3",   // 13
+		"x", "y", "z",
+		"f_dc_0", "f_dc_1", "f_dc_2",
+		"opacity",
+		"scale_0", "scale_1", "scale_2",
+		"rot_0", "rot_1", "rot_2", "rot_3",
 	};
-	// 1~3阶球谐系数：f_rest_0 ~ f_rest_44，RGB各15个
-	// PLY中存储顺序: R0..R14, G0..G14, B0..B14
+
 	std::vector<std::string> shProperties;
 	shProperties.reserve(45);
 	for (int i = 0; i < 45; ++i)
@@ -438,137 +468,117 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readFlyFile(const std::string& pl
 	miniply::PLYReader reader(ply_path.c_str());
 	if (!reader.valid()) {
 		std::cerr << "Failed to open " << ply_path << std::endl;
+		return points;
 	}
-	// Check we have a vertex element to pull data from
-	miniply::PLYElement* gsSplatEl = reader.get_element(reader.find_element("vertex"));
-	if (gsSplatEl == nullptr) {
-		std::cerr << "no vertex element could be found" << std::endl;
+
+	miniply::PLYElement* elem = reader.get_element(reader.find_element("vertex"));
+	if (!elem) {
+		std::cerr << "No vertex element found" << std::endl;
+		return points;
 	}
 
 	size_t num_gaussians = reader.num_rows();
 	points.reserve(num_gaussians);
 
-	// Getting all the indices where the relevant splat data is stored in the file
-	std::vector<uint32_t> gaussSplatIdx(properties.size());
-	for (int i = 0; i < properties.size(); ++i) {
-		gaussSplatIdx[i] = gsSplatEl->find_property(properties[i].c_str());
-	}
-	// 查找球谐属性索引，只收集有效的
+	std::vector<uint32_t> propIdx(properties.size());
+	for (size_t i = 0; i < properties.size(); ++i)
+		propIdx[i] = elem->find_property(properties[i].c_str());
+
 	std::vector<uint32_t> validShIdx;
-	std::vector<int> validShPos; // 对应在 sh[45] 中的位置
+	std::vector<int> validShPos;
 	for (int i = 0; i < 45; ++i) {
-		uint32_t idx = gsSplatEl->find_property(shProperties[i].c_str());
+		uint32_t idx = elem->find_property(shProperties[i].c_str());
 		if (idx != miniply::kInvalidIndex) {
 			validShIdx.push_back(idx);
 			validShPos.push_back(i);
 		}
 	}
-	bool hasSH = !validShIdx.empty();
+	bool fileSH = !validShIdx.empty();
 
 	reader.load_element();
 	float* filedata = new float[properties.size() * num_gaussians];
-	reader.extract_properties(
-		gaussSplatIdx.data(), properties.size(), miniply::PLYPropertyType::Float, filedata);
+	reader.extract_properties(propIdx.data(), (uint32_t)properties.size(),
+	                          miniply::PLYPropertyType::Float, filedata);
 
-	// 读取球谐系数（只读有效属性，避免 kInvalidIndex 导致 extract_properties 返回 false）
 	float* shdata = nullptr;
-	if (hasSH) {
+	if (fileSH) {
 		int nValid = (int)validShIdx.size();
 		float* rawSH = new float[nValid * num_gaussians]();
-		reader.extract_properties(
-			validShIdx.data(), nValid, miniply::PLYPropertyType::Float, rawSH);
-		// 展开到 45 槽位（无效位置保持 0）
+		reader.extract_properties(validShIdx.data(), nValid,
+		                          miniply::PLYPropertyType::Float, rawSH);
 		shdata = new float[45 * num_gaussians]();
-		for (size_t i = 0; i < num_gaussians; ++i) {
+		for (size_t i = 0; i < num_gaussians; ++i)
 			for (int k = 0; k < nValid; ++k)
 				shdata[i * 45 + validShPos[k]] = rawSH[i * nValid + k];
-		}
 		delete[] rawSH;
 	}
 
-	// Creating gaussian splats based on the data we read in
-	for (size_t i = 0; i < num_gaussians; ++i) {
-
-		int offset = i * properties.size();
+	for (size_t i = 0; i < num_gaussians; ++i)
+	{
+		int offset = (int)i * (int)properties.size();
 		MI_GaussianPoint g;
 
-		g.position = {
-			filedata[offset + 0],
-			filedata[offset + 1],
-			filedata[offset + 2]
-		};
+		g.position.set(filedata[offset + 0], filedata[offset + 1], filedata[offset + 2]);
 
-		g.color = {
-			filedata[offset + 3],
-			filedata[offset + 4],
-			filedata[offset + 5],
-			0.0f,
-		};
+		// DC color from SH_C0
+		g.color.set(
+			filedata[offset + 3] * SH_C0 + 0.5f,
+			filedata[offset + 4] * SH_C0 + 0.5f,
+			filedata[offset + 5] * SH_C0 + 0.5f,
+			1.0f / (1.0f + std::exp(-filedata[offset + 6]))
+		);
 
-		// Extract base color from spherical harmonics
-		//从球谐函数计算基础颜色
-		g.color = g.color*SH_0 + osg::Vec4f(0.5, 0.5, 0.5, 0.5);
-		//使用simgoid函数计算透明度
-		g.color[3] = 1.0f / (1.0f + exp(-(filedata[offset + 6])));
+		// Store scale in log-space exponentiated
+		g.scale.set(
+			std::exp(filedata[offset + 7]),
+			std::exp(filedata[offset + 8]),
+			std::exp(filedata[offset + 9])
+		);
 
-		// 存储1~3阶球谐系数
-		if (hasSH) {
+		// Quaternion (w, x, y, z) — normalize
+		float qw = filedata[offset + 10];
+		float qx = filedata[offset + 11];
+		float qy = filedata[offset + 12];
+		float qz = filedata[offset + 13];
+		float qlen = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+		if (qlen > 0.0f) { qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen; }
+		g.rotation.set(qx, qy, qz, qw);
+
+		if (fileSH) {
 			int shOffset = (int)i * 45;
 			for (int k = 0; k < 45; ++k)
 				g.sh[k] = shdata[shOffset + k];
 		}
 
-		glm::vec3 scale = {
-					glm::exp(filedata[offset + 7]),
-					glm::exp(filedata[offset + 8]),
-					glm::exp(filedata[offset + 9]),
-		};
-		glm::mat4 scale_mat = glm::scale(glm::mat4(1.0f), scale);
-
-		glm::quat rot = {
-			filedata[offset + 10],
-			filedata[offset + 11],
-			filedata[offset + 12],
-			filedata[offset + 13],
-		};
-		glm::mat4 rot_mat = glm::mat4(glm::mat3(rot));
-
-		auto rot_scale = rot_mat * scale_mat;
-		glm::mat4 sigma = rot_scale * glm::transpose(rot_scale);
-
-		g.sigma1 = osg::Vec4f(sigma[0][0], sigma[0][1], sigma[0][2], sigma[0][3]);
-		g.sigma2 = osg::Vec4f(sigma[1][0], sigma[1][1], sigma[1][2], sigma[1][3]);
-		g.sigma3 = osg::Vec4f(sigma[2][0], sigma[2][1], sigma[2][2], sigma[2][3]);
-
-
 		bounds.expandBy(g.position);
 		points.push_back(g);
-
 	}
-	// Clean up the float array as the gaussians are now stored in the vec "data"
+
 	delete[] filedata;
 	delete[] shdata;
+	this->hasSH = fileSH;
 
-	this->hasSH = hasSH;
+	std::cout << "Loaded " << points.size() << " Gaussian points from .ply" << std::endl;
 	return points;
 }
 
 osg::ref_ptr<osg::Geometry> GaussianDrawObj::createQuadGeometry()
-{ 
+{
 	osg::ref_ptr<osg::Geometry> quad = new osg::Geometry;
 
-	osg::ref_ptr<osg::Vec2Array> vertices = new osg::Vec2Array;
-	vertices->push_back(osg::Vec2(-2.0f, -2.0f)); 
-	vertices->push_back(osg::Vec2(2.0f, -2.0f));  
-	vertices->push_back(osg::Vec2(2.0f, 2.0f));   
-	vertices->push_back(osg::Vec2(-2.0f, 2.0f));  
-
+	osg::ref_ptr<osg::Vec3Array> vertices = new osg::Vec3Array(4);
+	(*vertices)[0].set( 1.0f,  1.0f, 0.0f);
+	(*vertices)[1].set(-1.0f,  1.0f, 0.0f);
+	(*vertices)[2].set( 1.0f, -1.0f, 0.0f);
+	(*vertices)[3].set(-1.0f, -1.0f, 0.0f);
 	quad->setVertexArray(vertices);
-	quad->setVertexAttribArray(0, vertices, osg::Array::BIND_PER_VERTEX);
-	
-	osg::ref_ptr<osg::DrawArrays> indices = new osg::DrawArrays(GL_TRIANGLE_FAN, 0, 4, nNum);
 
-	quad->addPrimitiveSet(indices);
+	osg::ref_ptr<osg::DrawElementsUShort> de =
+		new osg::DrawElementsUShort(GL_TRIANGLES);
+	de->push_back(0); de->push_back(1); de->push_back(2);
+	de->push_back(1); de->push_back(3); de->push_back(2);
+	de->setNumInstances(nNum);
+	quad->addPrimitiveSet(de);
 
 	quad->setCullingActive(false);
 	quad->setUseDisplayList(false);
@@ -576,11 +586,8 @@ osg::ref_ptr<osg::Geometry> GaussianDrawObj::createQuadGeometry()
 	return quad;
 }
 
-osg::Camera* g_camera = nullptr;
-void setMainCamera(osg::Camera* pC) {
-	g_camera = pC;
-}
-osg::Camera* getCamera() {
-	return g_camera;
-}
+// ======================== Global Camera ========================
 
+osg::Camera* g_camera = nullptr;
+void setMainCamera(osg::Camera* pC) { g_camera = pC; }
+osg::Camera* getCamera() { return g_camera; }
