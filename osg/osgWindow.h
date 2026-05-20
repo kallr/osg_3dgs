@@ -45,8 +45,8 @@ private:
 	osg::ref_ptr<osg::Group> root = new osg::Group;
 	osgViewer::GraphicsWindow *window = nullptr;
 	bool _bFirstFrame = true;
-	int _lastModifiers;  //¼üÅÌ±êÖ¾
-	GaussianDrawObj* pObj = nullptr;//¸ßË¹ÆÃ½¦¶ÔÏó
+	int _lastModifiers = 0;
+	GaussianDrawObj* pObj = nullptr;//ï¿½ï¿½Ë¹ï¿½Ã½ï¿½ï¿½ï¿½ï¿½ï¿½
 };
  
 #endif // GRAPHICSWINDOWQT_H

@@ -35,8 +35,11 @@ GraphicsWindowQt::GraphicsWindowQt(QWidget *parent)
     setFocusPolicy(Qt::StrongFocus);
 }
  
-GraphicsWindowQt::~GraphicsWindowQt(){ 
-	delete pObj;
+GraphicsWindowQt::~GraphicsWindowQt(){
+	if (pObj) {
+		getCamera()->setPreDrawCallback(nullptr);
+		delete pObj;
+	}
 }
  
 bool GraphicsWindowQt::event(QEvent *event)
@@ -254,11 +257,13 @@ void GraphicsWindowQt::loadModule(const std::string& file)
 	root->removeChildren(0, root->getNumChildren());
 
 	if (pObj) {
+		getCamera()->setPreDrawCallback(nullptr);
 		delete pObj; pObj = nullptr;
 	}
 
 	osg::ref_ptr<osg::Node>pLoadedNode;
-	if (file.find(".splat") != -1 || file.find(".ply") != -1)
+	if (file.find(".splat") != std::string::npos || file.find(".ply") != std::string::npos ||
+	    file.find(".spz") != std::string::npos || file.find(".ksplat") != std::string::npos)
 	{
 		setMainCamera(getCamera());
 		pObj = new GaussianDrawObj(file);

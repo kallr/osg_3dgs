@@ -13,9 +13,15 @@
 #include "tools/miniply.h"
 #include "tools/tools.h"
 
+#include "gf/core/gauss_ir.h"
+#include "gf/io/registry.h"
+#include "gf/io/reader.h"
+
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cfloat>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 
@@ -34,15 +40,19 @@ void GaussianSortThread::start()
 void GaussianSortThread::stop()
 {
 	_running = false;
+	_cv.notify_one();
 	if (_thread.joinable())
 		_thread.join();
 }
 
 void GaussianSortThread::requestSort(const osg::Matrix& modelView)
 {
-	std::lock_guard<std::mutex> lock(_taskMutex);
-	_taskModelView = modelView;
-	_hasTask = true;
+	{
+		std::lock_guard<std::mutex> lock(_taskMutex);
+		_taskModelView = modelView;
+		_hasTask = true;
+	}
+	_cv.notify_one();
 }
 
 void GaussianSortThread::setPositions(const std::vector<MI_GaussianPoint>* points, int numPoints)
@@ -64,11 +74,13 @@ void GaussianSortThread::run()
 {
 	while (_running)
 	{
-		if (!_hasTask)
 		{
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			continue;
+			std::unique_lock<std::mutex> lock(_taskMutex);
+			_cv.wait(lock, [this] { return _hasTask.load() || !_running.load(); });
 		}
+
+		if (!_running) break;
+		if (!_hasTask) continue;
 
 		osg::Matrix localMV;
 		int localNum;
@@ -90,8 +102,7 @@ void GaussianSortThread::run()
 			const osg::Vec3f& p = (*_points)[i].position;
 			float ez = (float)(p.x() * localMV(0, 2) + p.y() * localMV(1, 2) +
 			                    p.z() * localMV(2, 2) + localMV(3, 2));
-			// Flip sign for correct ordering
-			float d = (ez > 0.0f) ? 0.0f : -ez;
+			float d = (ez > 0.0f) ? FLT_MAX : -ez;
 			union { float f; uint32_t u; } un;
 			un.f = d;
 			keys[i] = un.u;
@@ -213,10 +224,35 @@ private:
 
 GaussianDrawObj::GaussianDrawObj(const std::string& name)
 {
-	if (name.find(".ply") != std::string::npos)
-		gaussianPoints = readPlyFile(name);
-	else if (name.find(".splat") != std::string::npos)
-		gaussianPoints = readSplatFile(name);
+	// Determine file extension
+	std::string ext;
+	size_t dotPos = name.rfind('.');
+	if (dotPos != std::string::npos)
+		ext = name.substr(dotPos + 1);
+
+	// Use GaussForge for all supported formats
+	if (ext == "spz" || ext == "ksplat")
+	{
+		gaussianPoints = readWithGaussForge(name, ext);
+	}
+	else if (ext == "ply")
+	{
+		// Try GaussForge first, fall back to miniply
+		gaussianPoints = readWithGaussForge(name, ext);
+		if (gaussianPoints.empty())
+			gaussianPoints = readPlyFile(name);
+	}
+	else if (ext == "splat")
+	{
+		gaussianPoints = readWithGaussForge(name, ext);
+		if (gaussianPoints.empty())
+			gaussianPoints = readSplatFile(name);
+	}
+	else
+	{
+		// Try GaussForge for any unknown extension
+		gaussianPoints = readWithGaussForge(name, ext);
+	}
 
 	nNum = (int)gaussianPoints.size();
 	depthIndex.resize(nNum);
@@ -319,7 +355,7 @@ void GaussianDrawObj::updateIndexImage(osg::Image* paramsImage)
 void GaussianDrawObj::loadShader(osg::StateSet* ss)
 {
 	osg::ref_ptr<osg::Program> program = new osg::Program;
-	std::string strDir = osg_tools::getAppDir() + "\\shader\\";
+	std::string strDir = osg_tools::getAppDir() + "/shader/";
 	osg::Shader* vs = osgDB::readShaderFile(osg::Shader::VERTEX, strDir + "gaussian.vert");
 	osg::Shader* fs = osgDB::readShaderFile(osg::Shader::FRAGMENT, strDir + "gaussian.frag");
 	if (vs) program->addShader(vs);
@@ -496,21 +532,20 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readPlyFile(const std::string& pl
 	bool fileSH = !validShIdx.empty();
 
 	reader.load_element();
-	float* filedata = new float[properties.size() * num_gaussians];
+	std::vector<float> filedata(properties.size() * num_gaussians);
 	reader.extract_properties(propIdx.data(), (uint32_t)properties.size(),
-	                          miniply::PLYPropertyType::Float, filedata);
+	                          miniply::PLYPropertyType::Float, filedata.data());
 
-	float* shdata = nullptr;
+	std::vector<float> shdata;
 	if (fileSH) {
 		int nValid = (int)validShIdx.size();
-		float* rawSH = new float[nValid * num_gaussians]();
+		std::vector<float> rawSH(nValid * num_gaussians, 0.0f);
 		reader.extract_properties(validShIdx.data(), nValid,
-		                          miniply::PLYPropertyType::Float, rawSH);
-		shdata = new float[45 * num_gaussians]();
+		                          miniply::PLYPropertyType::Float, rawSH.data());
+		shdata.resize(45 * num_gaussians, 0.0f);
 		for (size_t i = 0; i < num_gaussians; ++i)
 			for (int k = 0; k < nValid; ++k)
 				shdata[i * 45 + validShPos[k]] = rawSH[i * nValid + k];
-		delete[] rawSH;
 	}
 
 	for (size_t i = 0; i < num_gaussians; ++i)
@@ -554,11 +589,105 @@ std::vector<MI_GaussianPoint> GaussianDrawObj::readPlyFile(const std::string& pl
 		points.push_back(g);
 	}
 
-	delete[] filedata;
-	delete[] shdata;
 	this->hasSH = fileSH;
 
 	std::cout << "Loaded " << points.size() << " Gaussian points from .ply" << std::endl;
+	return points;
+}
+
+std::vector<MI_GaussianPoint> GaussianDrawObj::readWithGaussForge(
+	const std::string& filename, const std::string& ext)
+{
+	std::vector<MI_GaussianPoint> points;
+
+	std::ifstream file(filename, std::ios::binary | std::ios::ate);
+	if (!file) {
+		std::cerr << "Failed to open file: " << filename << std::endl;
+		return points;
+	}
+
+	size_t fileSize = (size_t)file.tellg();
+	file.seekg(0);
+	std::vector<uint8_t> buffer(fileSize);
+	file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
+	file.close();
+
+	gf::IORegistry registry;
+	gf::IGaussReader* reader = registry.ReaderForExt(ext);
+	if (!reader) {
+		std::cerr << "No GaussForge reader for extension: " << ext << std::endl;
+		return points;
+	}
+
+	gf::ReadOptions opts;
+	auto result = reader->Read(buffer.data(), buffer.size(), opts);
+	if (!result.ok()) {
+		std::cerr << "GaussForge read error: " << result.error().message << std::endl;
+		return points;
+	}
+
+	gf::GaussianCloudIR& ir = result.value();
+	int N = ir.numPoints;
+	int shPerPoint = (N > 0 && !ir.sh.empty()) ? (int)(ir.sh.size() / N) : 0;
+
+	points.reserve(N);
+	const float SH_C0 = 0.28209479177387814f;
+
+	for (int i = 0; i < N; ++i)
+	{
+		MI_GaussianPoint g;
+
+		g.position.set(
+			ir.positions[i * 3 + 0],
+			ir.positions[i * 3 + 1],
+			ir.positions[i * 3 + 2]
+		);
+
+		g.scale.set(
+			std::exp(ir.scales[i * 3 + 0]),
+			std::exp(ir.scales[i * 3 + 1]),
+			std::exp(ir.scales[i * 3 + 2])
+		);
+
+		// IR stores quaternion as [w, x, y, z], we store as [x, y, z, w]
+		float qw = ir.rotations[i * 4 + 0];
+		float qx = ir.rotations[i * 4 + 1];
+		float qy = ir.rotations[i * 4 + 2];
+		float qz = ir.rotations[i * 4 + 3];
+		float qlen = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+		if (qlen > 0.0f) { qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen; }
+		g.rotation.set(qx, qy, qz, qw);
+
+		// Color: SH DC coefficient -> RGB [0,1] + sigmoid opacity
+		g.color.set(
+			0.5f + SH_C0 * ir.colors[i * 3 + 0],
+			0.5f + SH_C0 * ir.colors[i * 3 + 1],
+			0.5f + SH_C0 * ir.colors[i * 3 + 2],
+			1.0f / (1.0f + std::exp(-ir.alphas[i]))
+		);
+
+		// SH coefficients: GaussForge stores RGB-interleaved per coefficient
+		// Our shader expects channel-grouped: [R0..R14, G0..G14, B0..B14]
+		std::memset(g.sh, 0, sizeof(g.sh));
+		if (shPerPoint > 0)
+		{
+			int numCoeffs = std::min(shPerPoint / 3, 15);
+			for (int c = 0; c < numCoeffs; ++c)
+			{
+				int srcBase = i * shPerPoint + c * 3;
+				g.sh[c]            = ir.sh[srcBase + 0]; // R channel
+				g.sh[c + 15]       = ir.sh[srcBase + 1]; // G channel
+				g.sh[c + 30]       = ir.sh[srcBase + 2]; // B channel
+			}
+		}
+
+		bounds.expandBy(g.position);
+		points.push_back(g);
+	}
+
+	this->hasSH = (shPerPoint > 0);
+	std::cout << "Loaded " << points.size() << " Gaussian points via GaussForge (."
+	          << ext << ")" << std::endl;
 	return points;
 }
 

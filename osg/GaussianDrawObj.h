@@ -13,6 +13,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
 
 struct MI_GaussianPoint {
 	osg::Vec3f position;
@@ -41,6 +42,7 @@ private:
 	std::thread _thread;
 	std::mutex _taskMutex;
 	std::mutex _resultMutex;
+	std::condition_variable _cv;
 	std::atomic<bool> _running{false};
 	std::atomic<bool> _hasTask{false};
 	std::atomic<bool> _hasResult{false};
@@ -76,6 +78,7 @@ private:
 
 	std::vector<MI_GaussianPoint> readSplatFile(const std::string& filename);
 	std::vector<MI_GaussianPoint> readPlyFile(const std::string& filename);
+	std::vector<MI_GaussianPoint> readWithGaussForge(const std::string& filename, const std::string& ext);
 	osg::ref_ptr<osg::Geometry> createQuadGeometry();
 
 private:

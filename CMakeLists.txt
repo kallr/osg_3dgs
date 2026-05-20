@@ -4,7 +4,7 @@ cmake_minimum_required (VERSION 3.12)
 set (PROJECT_NAME "osg_gaussian_draw")
 project (${PROJECT_NAME})
 
-# c++ 11
+# c++ 17
 set (CMAKE_CXX_STANDARD 17)
 
 SET (OSG_DEBUG_POSTFIX "d")
@@ -14,10 +14,11 @@ set (CMAKE_AUTOMOC ON)
 set (CMAKE_AUTORCC ON)
 set (CMAKE_AUTOUIC ON)
 
-
 # 自动寻找QT5
 find_package (Qt5 COMPONENTS Widgets Core Gui OpenGL REQUIRED)
 
+# zlib (required by spz format)
+find_package(ZLIB)
 
 #处理osg
 IF(OSG_ROOT)
@@ -25,7 +26,6 @@ IF(OSG_ROOT)
     SET(OSG_BUILD_INCLUDE_DIR "${OSG_ROOT}/include")
     SET(OSG_DEBUG_LIB_DIR     "${OSG_ROOT}/debug/lib")
     SET(OSG_RELEASE_LIB_DIR   "${OSG_ROOT}/release/lib")
-
 ELSE(OSG_ROOT)
     FIND_PATH(OSG_INCLUDE_DIR osg/Referenced
         $ENV{OSG_ROOT}/include
@@ -33,14 +33,12 @@ ELSE(OSG_ROOT)
         /usr/include
         /usr/local/include
     )
-
     FIND_PATH(OSG_BUILD_INCLUDE_DIR osg/Config
         $ENV{OSG_ROOT}/include
         $ENV{OSG_DIR}/include
         /usr/include
         /usr/local/include
     )
-
     FIND_PATH(OSG_DEBUG_LIB_DIR
         NAMES libosgd.a libosgd.dll.a libosgd.dylib libosgd.so osgd.lib
         PATHS ${THIRDPARTY_ROOT}/lib
@@ -63,74 +61,85 @@ ELSE(OSG_ROOT)
     )
 ENDIF(OSG_ROOT)
 
-
-FIND_PATH(GLM_DIR
-    NAMES glm/glm.hpp
-    HINTS ${PROJECT_SOURCE_DIR}/vac/util ${PROJECT_SOURCE_DIR}/app1
-)
-
-# GLM is no longer required (covariance computed on GPU)
-# Kept as optional for potential future use
- 
-
 # include
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/GaussForge
+    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/spz
     ${OSG_INCLUDE_DIR}
     ${OSG_BUILD_INCLUDE_DIR}
 )
- 
+
+# GaussForge sources (multi-format gaussian splatting IO)
+set(GAUSSFORGE_SRC
+    3rdparty/GaussForge/registry.cpp
+    3rdparty/GaussForge/ply_reader.cpp
+    3rdparty/GaussForge/ply_auto.cpp
+    3rdparty/GaussForge/ply_compressed_reader.cpp
+    3rdparty/GaussForge/splat_reader.cpp
+    3rdparty/GaussForge/ksplat_reader.cpp
+    3rdparty/GaussForge/validate.cpp
+)
+
+# SPZ format requires zlib
+if(ZLIB_FOUND)
+    list(APPEND GAUSSFORGE_SRC
+        3rdparty/GaussForge/spz_reader.cpp
+        3rdparty/spz/load-spz.cc
+        3rdparty/spz/splat-types.cc
+    )
+endif()
+
 # 源文件
 set (SRC_FILE
-        main.cpp
-        mainwindow.cpp
-        osg/osgWindow.cpp
-		osg/GaussianDrawObj.cpp
-        tools/tools.cpp
-		tools/miniply.cpp
+    main.cpp
+    mainwindow.cpp
+    osg/osgWindow.cpp
+    osg/GaussianDrawObj.cpp
+    tools/tools.cpp
+    tools/miniply.cpp
+    ${GAUSSFORGE_SRC}
 )
 
 # 头文件
 set (HEADER_FILE
-        mainwindow.h
-        osg/osgWindow.h
-		osg/GaussianDrawObj.h
-        tools/tools.h
-		tools/miniply.h
+    mainwindow.h
+    osg/osgWindow.h
+    osg/GaussianDrawObj.h
+    tools/tools.h
+    tools/miniply.h
 )
- 
 
 # shader
 set(SHADER
-gaussian.frag
-gaussian.vert
-point.vert
-point.frag
+    gaussian.frag
+    gaussian.vert
+    point.vert
+    point.frag
 )
 
 #加入项目文件
 add_executable (${PROJECT_NAME}
-        ${SRC_FILE}
-        ${HEADER_FILE}  
+    ${SRC_FILE}
+    ${HEADER_FILE}
 )
 
-
 # 链接Qt
-target_link_libraries(${PROJECT_NAME} Qt5::Widgets Qt5::Core Qt5::Gui) 
- 
+target_link_libraries(${PROJECT_NAME} Qt5::Widgets Qt5::Core Qt5::Gui)
+
+# 链接zlib (for spz format support)
+if(ZLIB_FOUND)
+    target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
+else()
+    message(WARNING "ZLIB not found - .spz format may not work")
+endif()
 
 MACRO(LINK_OSG_LIBRARY PROJECT_NAME)
     FOREACH(OSG_LIB_NAME ${ARGN})
-        STRING(FIND ${OSG_LIB_NAME} "OpenThreads" FOUND_OT_INDEX)
-        IF(FOUND_OT_INDEX GREATER "-1")
-            TARGET_LINK_LIBRARIES(${PROJECT_NAME}
-                debug     ${OSG_DEBUG_LIB_DIR}/${OSG_LIB_NAME}${OSG_DEBUG_POSTFIX}.lib
-                optimized ${OSG_RELEASE_LIB_DIR}/${OSG_LIB_NAME}.lib)
-        ELSE()
-            TARGET_LINK_LIBRARIES(${PROJECT_NAME}
-                debug     ${OSG_DEBUG_LIB_DIR}/${OSG_LIB_NAME}${OSG_DEBUG_POSTFIX}.lib
-                optimized ${OSG_RELEASE_LIB_DIR}/${OSG_LIB_NAME}.lib)
-        ENDIF()
+        TARGET_LINK_LIBRARIES(${PROJECT_NAME}
+            debug     ${OSG_DEBUG_LIB_DIR}/${OSG_LIB_NAME}${OSG_DEBUG_POSTFIX}.lib
+            optimized ${OSG_RELEASE_LIB_DIR}/${OSG_LIB_NAME}.lib)
     ENDFOREACH()
 ENDMACRO(LINK_OSG_LIBRARY)
 LINK_OSG_LIBRARY(${PROJECT_NAME} osgDB osgUtil osgViewer osgGA osg OpenThreads)

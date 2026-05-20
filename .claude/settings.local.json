@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(cmd.exe:*)",
-      "Read(//d/OpenSceneGraph/**)"
-    ]
-  }
-}
