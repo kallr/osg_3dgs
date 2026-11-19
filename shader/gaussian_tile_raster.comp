@@ -1,0 +1,722 @@
+#version 430 core
+
+// Tile-local raster pass. Consumes tile lists produced by gaussian_tile_bin.comp
+// and performs per-pixel Gaussian evaluation with front-to-back alpha blending.
+// Output is written to a 2D image bound at binding 7.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform int tileCount;
+uniform int tileListPerTileCapacity;
+uniform int tileSize;
+uniform int tileCountX;
+uniform int viewport_width;
+uniform int viewport_height;
+
+uniform samplerBuffer dataBuffer;
+uniform samplerBuffer shBuffer;
+uniform usamplerBuffer packedDataBuffer;  // RGBA32UI for packed/ext splats
+uniform samplerBuffer covSplatBuffer;     // RGBA32F for CovSplat data
+uniform bool hasSH;
+uniform int globalShOrder;
+uniform float minAlpha;
+uniform float falloff;
+uniform int usePackedEncoding;   // 0=legacy, 1=PackedSplat(16B), 2=ExtSplat(32B)
+uniform bool enableCovSplats;    // use direct 3D covariance
+uniform bool isOrthographic;     // orthographic projection mode
+uniform float focalDistance;      // depth-of-field: focus distance (>0 to enable)
+uniform float apertureAngle;     // depth-of-field: aperture full-width angle (radians)
+uniform float supportRadiusScale;
+uniform float maxScreenRadius;
+uniform float minPixelRadius;
+uniform float preBlurAmount;
+uniform float blurAmount;
+uniform bool enableBlurCompensation;
+uniform bool sparkRadiusClamp;
+uniform bool lodInflate;
+uniform bool enable2DGS;
+uniform float clipXY;               // NDC guard band half-width (default 2.0)
+uniform bool outputSRGB;            // Apply gamma correction for sRGB framebuffer
+uniform bool isColorPremultiplied;  // true for PLY, false for RAD
+uniform bool useSparkPagedPool;     // Spark Paged Pool mode flag
+uniform int debugFlag;              // 0=off, 1=depth, 2=normal
+
+// Splat edit uniforms
+uniform bool enableSplatEdit;
+uniform usampler2D sdfTexture;
+uniform int numSdfs;
+uniform int numEdits;
+uniform vec4 editData[8]; // max 8 edits, packed as float bits of uint32
+
+// Splat skinning uniforms
+uniform bool enableSkinning;
+uniform int skinningMode;  // 0=DQ, 1=LB
+uniform usamplerBuffer skinSampler;
+uniform samplerBuffer boneSampler;
+uniform int skinningNumSplats;
+uniform int skinningNumBones;
+
+uniform mat4 view;
+uniform mat4 proj;
+uniform vec2 viewport_size;
+
+layout(std430, binding = 3) readonly buffer TileCountBuffer
+{
+    uint tileCounts[];
+};
+
+layout(std430, binding = 5) readonly buffer TileListBuffer
+{
+    int tileList[];
+};
+
+layout(std430, binding = 6) buffer TileStatsBuffer
+{
+    uint tileStats[];
+};
+
+layout(rgba32f, binding = 7) writeonly uniform image2D outputImage;
+
+// ============================================================================
+// Packed encoding decode utilities (matching gaussian.vert)
+// ============================================================================
+
+const float LN_SCALE_MIN = -12.0;
+const float LN_SCALE_MAX = 9.0;
+const float LN_SCALE_SCALE = (LN_SCALE_MAX - LN_SCALE_MIN) / 254.0;
+
+float fromHalf(uint h)
+{
+    uint sign = (h >> 15) & 1u;
+    uint exp = (h >> 10) & 0x1fu;
+    uint frac = h & 0x3ffu;
+    uint f32bits;
+    if (exp == 0u) {
+        if (frac == 0u) {
+            f32bits = sign << 31u;
+        } else {
+            uint mant = frac;
+            int e = -14;
+            while ((mant & 0x400u) == 0u) { mant <<= 1u; e--; }
+            mant &= 0x3ffu;
+            f32bits = (sign << 31u) | (uint(e + 127) << 23u) | (mant << 13u);
+        }
+    } else if (exp == 0x1fu) {
+        f32bits = (frac == 0u) ? ((sign << 31u) | 0x7f800000u) : ((sign << 31u) | 0x7fc00000u);
+    } else {
+        f32bits = (sign << 31u) | ((exp - 15u + 127u) << 23u) | (frac << 13u);
+    }
+    return uintBitsToFloat(f32bits);
+}
+
+vec3 octDecode(float u, float v)
+{
+    float z = 1.0 - (abs(u) + abs(v));
+    float t = max(-z, 0.0);
+    float fx = u + (u >= 0.0 ? -t : t);
+    float fy = v + (v >= 0.0 ? -t : t);
+    vec3 axis = vec3(fx, fy, z);
+    float len = length(axis);
+    return len < 1e-6 ? vec3(1.0, 0.0, 0.0) : axis / len;
+}
+
+vec4 decodeQuatOctXy88R8(uint encoded)
+{
+    uint quantU = encoded & 0xffu;
+    uint quantV = (encoded >> 8u) & 0xffu;
+    uint angleInt = (encoded >> 16u) & 0xffu;
+    float uf = float(quantU) / 255.0;
+    float vf = float(quantV) / 255.0;
+    float fx = (uf - 0.5) * 2.0;
+    float fy = (vf - 0.5) * 2.0;
+    vec3 axis = octDecode(fx, fy);
+    float theta = float(angleInt) / 255.0 * 3.141592653589793;
+    float halfTheta = theta * 0.5;
+    float s = sin(halfTheta);
+    return vec4(axis * s, cos(halfTheta));
+}
+
+vec4 decodeQuatOctXy1010R12(uint encoded)
+{
+    uint quantU = encoded & 0x3ffu;
+    uint quantV = (encoded >> 10u) & 0x3ffu;
+    uint angleInt = (encoded >> 20u) & 0xfffu;
+    float fx = float(quantU) / 1023.0 * 2.0 - 1.0;
+    float fy = float(quantV) / 1023.0 * 2.0 - 1.0;
+    vec3 axis = octDecode(fx, fy);
+    float theta = float(angleInt) / 4095.0 * 3.141592653589793;
+    float halfTheta = theta * 0.5;
+    float s = sin(halfTheta);
+    return vec4(axis * s, cos(halfTheta));
+}
+
+float decodeScaleLn0R8(uint encoded)
+{
+    if (encoded == 0u) return 0.0;
+    return exp(LN_SCALE_MIN + float(encoded - 1u) * LN_SCALE_SCALE);
+}
+
+// Decode splat data from physical index (Paged Pool mode)
+void decodePackedSplatPhysical(int physicalIdx, out vec3 position, out vec3 scale,
+                       out vec4 quat, out vec3 color, out float alpha, out int shOrder)
+{
+    uvec4 w = texelFetch(packedDataBuffer, physicalIdx);
+    color = vec3(float(w.x & 0xffu), float((w.x >> 8u) & 0xffu), float((w.x >> 16u) & 0xffu)) / 255.0;
+    alpha = float((w.x >> 24u) & 0xffu) / 255.0;
+    position = vec3(fromHalf(w.y & 0xffffu), fromHalf((w.y >> 16u) & 0xffffu), fromHalf(w.z & 0xffffu));
+    scale = vec3(decodeScaleLn0R8(w.w & 0xffu), decodeScaleLn0R8((w.w >> 8u) & 0xffu), decodeScaleLn0R8((w.w >> 16u) & 0xffu));
+    uint quatU = (w.z >> 16u) & 0xffu;
+    uint quatV = (w.z >> 24u) & 0xffu;
+    uint quatR = (w.w >> 24u) & 0xffu;
+    uint quatEncoded = quatR << 16u | quatV << 8u | quatU;
+    quat = decodeQuatOctXy88R8(quatEncoded);
+    shOrder = hasSH ? globalShOrder : 0;
+}
+
+void decodeExtSplatPhysical(int physicalIdx, out vec3 position, out vec3 scale,
+                    out vec4 quat, out vec3 color, out float alpha, out int shOrder)
+{
+    uvec4 extA = texelFetch(packedDataBuffer, physicalIdx * 2);
+    uvec4 extB = texelFetch(packedDataBuffer, physicalIdx * 2 + 1);
+    position = vec3(uintBitsToFloat(extA.x), uintBitsToFloat(extA.y), uintBitsToFloat(extA.z));
+    alpha = fromHalf(extA.w & 0xffffu);
+    color = vec3(fromHalf(extB.x & 0xffffu), fromHalf((extB.x >> 16u) & 0xffffu), fromHalf(extB.y & 0xffffu));
+    scale = vec3(exp(fromHalf((extB.y >> 16u) & 0xffffu)), exp(fromHalf(extB.z & 0xffffu)), exp(fromHalf((extB.z >> 16u) & 0xffffu)));
+    quat = decodeQuatOctXy1010R12(extB.w);
+    shOrder = hasSH ? globalShOrder : 0;
+}
+
+void decodePackedSplat(int splatIndex, out vec3 position, out vec3 scale,
+                       out vec4 quat, out vec3 color, out float alpha, out int shOrder)
+{
+    uvec4 w = texelFetch(packedDataBuffer, splatIndex);
+    color = vec3(float(w.x & 0xffu), float((w.x >> 8u) & 0xffu), float((w.x >> 16u) & 0xffu)) / 255.0;
+    alpha = float((w.x >> 24u) & 0xffu) / 255.0;
+    position = vec3(fromHalf(w.y & 0xffffu), fromHalf((w.y >> 16u) & 0xffffu), fromHalf(w.z & 0xffffu));
+    scale = vec3(decodeScaleLn0R8(w.w & 0xffu), decodeScaleLn0R8((w.w >> 8u) & 0xffu), decodeScaleLn0R8((w.w >> 16u) & 0xffu));
+    uint quatU = (w.z >> 16u) & 0xffu;
+    uint quatV = (w.z >> 24u) & 0xffu;
+    uint quatR = (w.w >> 24u) & 0xffu;
+    uint quatEncoded = quatR << 16u | quatV << 8u | quatU;
+    quat = decodeQuatOctXy88R8(quatEncoded);
+    shOrder = hasSH ? globalShOrder : 0;
+}
+
+void decodeExtSplat(int splatIndex, out vec3 position, out vec3 scale,
+                    out vec4 quat, out vec3 color, out float alpha, out int shOrder)
+{
+    uvec4 extA = texelFetch(packedDataBuffer, splatIndex * 2);
+    uvec4 extB = texelFetch(packedDataBuffer, splatIndex * 2 + 1);
+    position = vec3(uintBitsToFloat(extA.x), uintBitsToFloat(extA.y), uintBitsToFloat(extA.z));
+    alpha = fromHalf(extA.w & 0xffffu);
+    color = vec3(fromHalf(extB.x & 0xffffu), fromHalf((extB.x >> 16u) & 0xffffu), fromHalf(extB.y & 0xffffu));
+    scale = vec3(exp(fromHalf((extB.y >> 16u) & 0xffffu)), exp(fromHalf(extB.z & 0xffffu)), exp(fromHalf((extB.z >> 16u) & 0xffffu)));
+    // Quaternion (OctXy1010R12)
+    quat = decodeQuatOctXy1010R12(extB.w);
+    shOrder = hasSH ? globalShOrder : 0;
+}
+
+
+// ============================================================================
+// Core math
+// ============================================================================
+
+mat3 quatToRotation(vec4 q)
+{
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float x2 = x + x, y2 = y + y, z2 = z + z;
+    float xx = x * x2, xy = x * y2, xz = x * z2;
+    float yy = y * y2, yz = y * z2, zz = z * z2;
+    float wx = w * x2, wy = w * y2, wz = w * z2;
+    return mat3(
+        1.0 - (yy + zz), xy + wz, xz - wy,
+        xy - wz, 1.0 - (xx + zz), yz + wx,
+        xz + wy, yz - wx, 1.0 - (xx + yy)
+    );
+}
+
+mat3 computeCovariance(vec3 scale, vec4 quat)
+{
+    mat3 R = quatToRotation(quat);
+    mat3 S2 = mat3(
+        scale.x * scale.x, 0.0, 0.0,
+        0.0, scale.y * scale.y, 0.0,
+        0.0, 0.0, scale.z * scale.z
+    );
+    return R * S2 * transpose(R);
+}
+
+mat3 computeCovarianceDirect(vec3 xxyyzz, vec3 xyxzyz, mat3 viewBasis)
+{
+    mat3 cov = mat3(
+        xxyyzz.x, xyxzyz.x, xyxzyz.y,
+        xyxzyz.x, xxyyzz.y, xyxzyz.z,
+        xyxzyz.y, xyxzyz.z, xxyyzz.z
+    );
+    return viewBasis * cov * transpose(viewBasis);
+}
+
+mat2 inverseMat2(mat2 m)
+{
+    float det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+    float safeDet = (det >= 0.0) ? max(det, 1.0e-12) : min(det, -1.0e-12);
+    return mat2(m[1][1], -m[0][1], -m[1][0], m[0][0]) / safeDet;
+}
+
+// SH constants
+const float SH_C1 = 0.4886025119029199;
+const float SH_C2[5] = float[5](
+    1.0925484305920792, -1.0925484305920792,
+    0.31539156525252005, -1.0925484305920792, 0.5462742152960396
+);
+const float SH_C3[7] = float[7](
+    -0.5900435899266435, 2.890611442640554, -0.4570457994644658,
+    0.3731763325901154, -0.4570457994644658, 1.445305721320277, -0.5900435899266435
+);
+
+vec3 evalSphericalHarmonics(vec3 dir, vec3 dc, int shBase, int shOrder)
+{
+    float x = dir.x, y = dir.y, z = dir.z;
+    vec3 col = dc;
+
+    float sh[45] = float[45](
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    // CPU uploads 15 coefficients per color channel, padded to 12 RGBA
+    // texels per splat. A low SH order is not a contiguous texel prefix:
+    // green starts at float 15 and blue at float 30 even for SH1.
+    int coefficientCount = shOrder == 1 ? 3 : (shOrder == 2 ? 8 : 15);
+    int lastTexel = -1;
+    vec4 values = vec4(0.0);
+    for (int channel = 0; channel < 3; ++channel) {
+        int begin = channel * 15;
+        int end = begin + coefficientCount;
+        for (int texel = begin / 4; texel <= (end - 1) / 4; ++texel) {
+            // Reuse a boundary texel shared by adjacent full-order channels.
+            if (texel != lastTexel) {
+                values = texelFetch(shBuffer, shBase + texel);
+                lastTexel = texel;
+            }
+            for (int component = 0; component < 4; ++component) {
+                int index = texel * 4 + component;
+                if (index >= begin && index < end)
+                    sh[index] = values[component];
+            }
+        }
+    }
+
+    col.r += SH_C1 * (-y * sh[0]  + z * sh[1]  - x * sh[2]);
+    col.g += SH_C1 * (-y * sh[15] + z * sh[16] - x * sh[17]);
+    col.b += SH_C1 * (-y * sh[30] + z * sh[31] - x * sh[32]);
+    if (shOrder < 2) return clamp(col, 0.0, 1.0);
+
+    float xx = x*x, yy = y*y, zz = z*z, xy = x*y, xz = x*z, yz = y*z;
+    col.r += SH_C2[0]*xy*sh[3] + SH_C2[1]*yz*sh[4] + SH_C2[2]*(2*zz-xx-yy)*sh[5]
+           + SH_C2[3]*xz*sh[6] + SH_C2[4]*(xx-yy)*sh[7];
+    col.g += SH_C2[0]*xy*sh[18] + SH_C2[1]*yz*sh[19] + SH_C2[2]*(2*zz-xx-yy)*sh[20]
+           + SH_C2[3]*xz*sh[21] + SH_C2[4]*(xx-yy)*sh[22];
+    col.b += SH_C2[0]*xy*sh[33] + SH_C2[1]*yz*sh[34] + SH_C2[2]*(2*zz-xx-yy)*sh[35]
+           + SH_C2[3]*xz*sh[36] + SH_C2[4]*(xx-yy)*sh[37];
+    if (shOrder < 3) return clamp(col, 0.0, 1.0);
+
+    col.r += SH_C3[0]*y*(3*xx-yy)*sh[8] + SH_C3[1]*xy*z*sh[9]
+           + SH_C3[2]*y*(4*zz-xx-yy)*sh[10] + SH_C3[3]*z*(2*zz-3*xx-3*yy)*sh[11]
+           + SH_C3[4]*x*(4*zz-xx-yy)*sh[12] + SH_C3[5]*z*(xx-yy)*sh[13]
+           + SH_C3[6]*x*(xx-3*yy)*sh[14];
+    col.g += SH_C3[0]*y*(3*xx-yy)*sh[23] + SH_C3[1]*xy*z*sh[24]
+           + SH_C3[2]*y*(4*zz-xx-yy)*sh[25] + SH_C3[3]*z*(2*zz-3*xx-3*yy)*sh[26]
+           + SH_C3[4]*x*(4*zz-xx-yy)*sh[27] + SH_C3[5]*z*(xx-yy)*sh[28]
+           + SH_C3[6]*x*(xx-3*yy)*sh[29];
+    col.b += SH_C3[0]*y*(3*xx-yy)*sh[38] + SH_C3[1]*xy*z*sh[39]
+           + SH_C3[2]*y*(4*zz-xx-yy)*sh[40] + SH_C3[3]*z*(2*zz-3*xx-3*yy)*sh[41]
+           + SH_C3[4]*x*(4*zz-xx-yy)*sh[42] + SH_C3[5]*z*(xx-yy)*sh[43]
+           + SH_C3[6]*x*(xx-3*yy)*sh[44];
+
+    return clamp(col, 0.0, 1.0);
+}
+
+void main()
+{
+    // Each work group processes one tile.
+    // 2D dispatch: tileId = gl_WorkGroupID.y * tileCountX + gl_WorkGroupID.x
+    // gl_LocalInvocationID = pixel within tile.
+    uint tileId = gl_WorkGroupID.y * uint(tileCountX) + gl_WorkGroupID.x;
+    if (tileId >= uint(tileCount))
+        return;
+
+    // Pixel coordinates within the tile
+    int localX = int(gl_LocalInvocationID.x);
+    int localY = int(gl_LocalInvocationID.y);
+    if (localX >= tileSize || localY >= tileSize)
+        return;
+
+    // Global pixel coordinates
+    int tileX = int(tileId % uint(tileCountX));
+    int tileY = int(tileId / uint(tileCountX));
+    int pixelX = tileX * tileSize + localX;
+    int pixelY = tileY * tileSize + localY;
+    if (pixelX >= viewport_width || pixelY >= viewport_height)
+        return;
+
+    // Screen-space position of this pixel (center of pixel)
+    vec2 pixelCenter = vec2(float(pixelX) + 0.5, float(pixelY) + 0.5);
+
+    // Front-to-back alpha blending accumulator
+    vec3 accumColor = vec3(0.0);
+    float accumAlpha = 0.0;
+
+    uint count = min(tileCounts[int(tileId)], uint(tileListPerTileCapacity));
+
+    for (uint i = 0u; i < count; ++i) {
+        if (accumAlpha > 0.995)
+            break;
+
+        int splatIndex = tileList[int(tileId) * tileListPerTileCapacity + int(i)];
+        if (splatIndex < 0)
+            continue;
+
+        // Decode splat data based on encoding mode
+        vec3 position;
+        vec3 scale;
+        vec4 quat;
+        vec3 color;
+        float alpha;
+        int shOrder;
+
+        if (useSparkPagedPool) {
+            if (usePackedEncoding == 1) {
+                decodePackedSplatPhysical(splatIndex, position, scale, quat, color, alpha, shOrder);
+                alpha *= 2.0;
+            } else if (usePackedEncoding == 2) {
+                decodeExtSplatPhysical(splatIndex, position, scale, quat, color, alpha, shOrder);
+            } else {
+                // Legacy path with physical addressing
+                int dataBase = splatIndex * 4;
+                vec4 posAlpha = texelFetch(dataBuffer, dataBase + 0);
+                vec4 scaleR   = texelFetch(dataBuffer, dataBase + 1);
+                vec4 quatXYZG = texelFetch(dataBuffer, dataBase + 2);
+                vec4 quatWB   = texelFetch(dataBuffer, dataBase + 3);
+
+                position = posAlpha.xyz;
+                alpha    = posAlpha.w;
+                scale    = scaleR.xyz;
+                color    = vec3(scaleR.w, quatXYZG.w, quatWB.w);
+                quat     = vec4(quatXYZG.xyz, quatWB.x);
+                shOrder  = int(quatWB.y);
+            }
+        } else {
+            if (usePackedEncoding == 1) {
+                decodePackedSplat(splatIndex, position, scale, quat, color, alpha, shOrder);
+                alpha *= 2.0; 
+            } else if (usePackedEncoding == 2) {
+                decodeExtSplat(splatIndex, position, scale, quat, color, alpha, shOrder);
+            } else {
+                // Legacy path: 4x vec4 per splat
+                int dataBase = splatIndex * 4;
+                vec4 posAlpha = texelFetch(dataBuffer, dataBase + 0);
+                vec4 scaleR   = texelFetch(dataBuffer, dataBase + 1);
+                vec4 quatXYZG = texelFetch(dataBuffer, dataBase + 2);
+                vec4 quatWB   = texelFetch(dataBuffer, dataBase + 3);
+
+                position = posAlpha.xyz;
+                alpha    = posAlpha.w;
+                scale    = scaleR.xyz;
+                color    = vec3(scaleR.w, quatXYZG.w, quatWB.w);
+                quat     = vec4(quatXYZG.xyz, quatWB.x);
+                shOrder  = int(quatWB.y);
+            }
+        }
+
+        // 2DGS: handle zero scales
+        bvec3 zeroScales = equal(scale, vec3(0.0));
+        if (enable2DGS && any(zeroScales)) {
+            if (all(zeroScales))
+                continue; // Degenerate
+            
+            // For 2DGS, we approximate the footprint by treating the zero axis as very small 
+            // instead of completely skipping, or we just rely on the fallback path. 
+            // In a fully accurate 2DGS tile rasterizer, we'd do ray-plane intersection. 
+            // Here we just bump the zero scale to a tiny epsilon so 3D covariance math still works 
+            // without singularity, matching the spirit of the instanced quad path.
+            if (zeroScales.x) scale.x = 1e-6;
+            if (zeroScales.y) scale.y = 1e-6;
+            if (zeroScales.z) scale.z = 1e-6;
+        }
+
+        // ------------------------------------------------------------------------
+        // Spark LOD Inflation & Alpha stretching
+        // ------------------------------------------------------------------------
+        float adjustedStdDev = 2.8284271; // maxStdDev
+        float covRescale = 1.0; // CovSplat LOD inflate rescale factor
+        if (alpha > 1.0) {
+            alpha = min(alpha * 4.0 - 3.0, 5.0);
+
+            if (lodInflate) {
+                float density = exp((alpha * alpha - 1.0) / 2.718281828459045);
+                float rescale = pow(max(density, 1.0e-6), 1.0 / 3.0);
+                scale *= rescale;
+                covRescale = rescale * rescale; // cov = rescale^2 * cov
+                alpha = 1.0;
+            }
+
+            adjustedStdDev += 0.7 * (alpha - 1.0);
+        }
+
+    // Apply skinning before view transform
+        vec3 skinnedXxyyzz = vec3(0.0);
+        vec3 skinnedXyxzyz = vec3(0.0);
+        bool hasSkinnedCov = false;
+        if (enableSkinning) {
+            if (enableCovSplats) {
+                vec4 covA = texelFetch(covSplatBuffer, splatIndex * 2);
+                vec4 covB = texelFetch(covSplatBuffer, splatIndex * 2 + 1);
+                skinnedXxyyzz = covA.xyz;
+                skinnedXyxzyz = vec3(covA.w, covB.xy);
+                if (skinningMode == 0) {
+                    applyCovSplatDQSkinning(skinSampler, boneSampler, skinningNumSplats, skinningNumBones,
+                                            splatIndex, position, skinnedXxyyzz, skinnedXyxzyz);
+                } else {
+                    applyCovSplatLBSkinning(skinSampler, boneSampler, skinningNumSplats, skinningNumBones,
+                                            splatIndex, position, skinnedXxyyzz, skinnedXyxzyz);
+                }
+                hasSkinnedCov = true;
+            } else {
+                if (skinningMode == 0) {
+                    applyGsplatSkinningDQ(skinSampler, boneSampler, skinningNumSplats, skinningNumBones,
+                                          splatIndex, position, quat);
+                }
+            }
+        }
+
+        vec4 editRgbaScale = vec4(1.0);
+        vec4 editRgbaOffset = vec4(0.0);
+        if (enableSplatEdit) {
+            for (int ei = 0; ei < numEdits && ei < 8; ++ei) {
+                uvec4 packedEdit = uvec4(floatBitsToUint(editData[ei].x),
+                                         floatBitsToUint(editData[ei].y),
+                                         floatBitsToUint(editData[ei].z),
+                                         floatBitsToUint(editData[ei].w));
+                accumulatePackedRgbaDisplaceEdit(packedEdit, sdfTexture, numSdfs,
+                                                 position, editRgbaScale, editRgbaOffset);
+            }
+        }
+
+        // Transform to eye space
+        vec4 eyePos = view * vec4(position, 1.0);
+        if (eyePos.z > 0.0)
+            continue;
+
+        // Compute 3D covariance
+        mat3 sigma;
+        mat3 W = mat3(view);
+
+        if (enableCovSplats) {
+            vec3 xxyyzz, xyxzyz;
+            if (hasSkinnedCov) {
+                xxyyzz = skinnedXxyyzz;
+                xyxzyz = skinnedXyxzyz;
+            } else {
+                vec4 covA = texelFetch(covSplatBuffer, splatIndex * 2);
+                vec4 covB = texelFetch(covSplatBuffer, splatIndex * 2 + 1);
+                xxyyzz = covA.xyz;
+                xyxzyz = vec3(covA.w, covB.xy);
+            }
+            if (all(equal(xxyyzz, vec3(0.0))) && all(equal(xyxzyz, vec3(0.0))))
+                continue;
+            sigma = computeCovarianceDirect(xxyyzz, xyxzyz, W);
+            if (covRescale != 1.0) {
+                sigma *= covRescale; // LOD inflate: cov = rescale^2 * cov
+            }
+        } else {
+            sigma = computeCovariance(scale, quat);
+        }
+
+        // Jacobian of projection (perspective or orthographic)
+        float focal_x = proj[0][0] * viewport_size.x * 0.5;
+        float focal_y = proj[1][1] * viewport_size.y * 0.5;
+
+        mat3 J;
+        if (isOrthographic) {
+            J = mat3(
+                focal_x, 0.0, 0.0,
+                0.0, focal_y, 0.0,
+                0.0, 0.0, 0.0
+            );
+        } else {
+            float invZ = 1.0 / eyePos.z;
+            vec2 J1 = vec2(focal_x * invZ, focal_y * invZ);
+            vec2 J2 = -(J1 * eyePos.xy) * invZ;
+            J = mat3(
+                J1.x, 0.0, 0.0,  // Column 0
+                0.0, J1.y, 0.0,  // Column 1
+                J2.x, J2.y, 0.0  // Column 2
+            );
+        }
+
+        // Project 3D covariance to 2D
+        mat3 sigma_prime;
+        if (enableCovSplats) {
+            sigma_prime = J * sigma * transpose(J);
+        } else {
+            mat3 JW = J * W;
+            sigma_prime = JW * sigma * transpose(JW);
+        }
+
+        // Add blur for anti-aliasing
+        sigma_prime[0][0] += preBlurAmount;
+        sigma_prime[1][1] += preBlurAmount;
+        mat2 covOrig = mat2(sigma_prime);
+        float detOrig = covOrig[0][0] * covOrig[1][1] - covOrig[0][1] * covOrig[1][0];
+
+        // Depth-of-field blur
+        float fullBlurAmount = blurAmount;
+        if (focalDistance > 0.0 && apertureAngle > 0.0) {
+            if (eyePos.z < 0.0) {
+                float focusBlur = abs((-eyePos.z - focalDistance) / eyePos.z);
+                float apertureRadius = focal_x * tan(0.5 * apertureAngle);
+                float focusRadius = focusBlur * apertureRadius;
+                fullBlurAmount = clamp(focusRadius * focusRadius, blurAmount, maxScreenRadius * maxScreenRadius);
+            }
+        }
+
+        sigma_prime[0][0] += fullBlurAmount;
+        sigma_prime[1][1] += fullBlurAmount;
+
+        mat2 cov2D = mat2(sigma_prime);
+        float detBlur = cov2D[0][0] * cov2D[1][1] - cov2D[0][1] * cov2D[1][0];
+
+        // NDC projection for center
+        vec4 projPos = proj * eyePos;
+        vec3 ndc = projPos.xyz / projPos.w;
+
+        // Guard band
+        if (ndc.x < -clipXY || ndc.x > clipXY || ndc.y < -clipXY || ndc.y > clipXY)
+            continue;
+
+        // Screen-space center
+        vec2 center2D = vec2(
+            0.5 * (viewport_size.x + ndc.x * viewport_size.x),
+            0.5 * (viewport_size.y + ndc.y * viewport_size.y)
+        );
+
+        // Compute eigenvalues and clamp (matching gaussian.vert)
+        float a = cov2D[0][0], b = cov2D[0][1], c = cov2D[1][1];
+        float apco2 = (a + c) * 0.5;
+        float amco2 = (a - c) * 0.5;
+        float term = sqrt(amco2 * amco2 + b * b);
+        float lambda1 = apco2 + term;
+        float lambda2 = apco2 - term;
+        lambda1 = max(lambda1, 0.1);
+        lambda2 = max(lambda2, 0.1);
+
+        // Blur compensation
+        if (enableBlurCompensation && detOrig > 1.0e-12 && detBlur > 1.0e-12) {
+            alpha *= sqrt(max(0.0, detOrig / detBlur));
+        }
+
+        adjustedStdDev *= supportRadiusScale;
+
+        // Compute radii from eigenvalues
+        float r1 = adjustedStdDev * sqrt(lambda1);
+        float r2 = adjustedStdDev * sqrt(lambda2);
+        float maxRadius = max(r1, r2);
+
+        // sparkRadiusClamp logic (matching gaussian.vert)
+        float covInvScale = 1.0;
+        if (sparkRadiusClamp) {
+            r1 = min(r1, maxScreenRadius);
+            r2 = min(r2, maxScreenRadius);
+        } else if (maxRadius > maxScreenRadius) {
+            float radiusScale = maxScreenRadius / maxRadius;
+            r1 *= radiusScale;
+            r2 *= radiusScale;
+            covInvScale = 1.0 / max(radiusScale * radiusScale, 1.0e-6);
+        }
+
+        // minPixelRadius culling (matching gaussian.vert)
+        if (r1 < minPixelRadius && r2 < minPixelRadius)
+            continue;
+
+        // Early distance check using max radius
+        vec2 dCenter = pixelCenter - center2D;
+        float maxR = max(r1, r2);
+        if (dot(dCenter, dCenter) > maxR * maxR)
+            continue;
+
+        // Compute 2D covariance inverse (from original cov2D, matching gaussian.vert)
+        if (detBlur < 1.0e-12)
+            continue;
+        mat2 cov2Dinv = inverseMat2(cov2D);
+        cov2Dinv = mat2(cov2Dinv[0] * covInvScale, cov2Dinv[1] * covInvScale);
+
+        // Evaluate Gaussian at this pixel
+        float z2 = dot(dCenter, cov2Dinv * dCenter);
+        if (z2 > adjustedStdDev * adjustedStdDev)
+            continue;
+
+        float gaussianFalloff = exp(-0.5 * z2);
+        float falloffMix = clamp(falloff, 0.0, 1.0);
+        float profile = mix(1.0, gaussianFalloff, falloffMix);
+
+        // Compute unpremultiplied color with SH. The uploaded data stores RGB premultiplied
+        // by base alpha (for PLY) or base color (for RAD).
+        float colorAlpha = min(alpha, 1.0);
+        vec3 splatColor = color;
+        if (isColorPremultiplied) {
+            splatColor = color / max(colorAlpha, 1.0e-6);
+        }
+        if (hasSH && shOrder > 0) {
+            mat3 viewRot = mat3(view);
+            vec3 camPos = -transpose(viewRot) * view[3].xyz;
+            vec3 dir = normalize(position - camPos);
+            int shBase = splatIndex * 12;
+            splatColor = evalSphericalHarmonics(dir, splatColor, shBase, shOrder);
+        }
+
+        if (enableSplatEdit) {
+            vec4 editRgba = vec4(splatColor, alpha) * editRgbaScale + editRgbaOffset;
+            splatColor = editRgba.rgb;
+            alpha = editRgba.a;
+        }
+
+        // Compute final alpha after final RGBA edits.
+        float splatAlpha;
+        if (alpha > 1.0) {
+            float density = exp((alpha * alpha - 1.0) / 2.718281828459045);
+            splatAlpha = mix(1.0, 1.0 - pow(1.0 - gaussianFalloff, density), falloffMix);
+        } else {
+            splatAlpha = alpha * profile;
+        }
+
+        if (splatAlpha < minAlpha)
+            continue;
+
+        // Debug visualization
+        if (debugFlag == 1) {
+            // Depth: map eye-space Z to grayscale (near=bright, far=dark)
+            float depthVis = clamp(-eyePos.z / 100.0, 0.0, 1.0);
+            splatColor = vec3(1.0 - depthVis);
+            alpha = 1.0;
+            splatAlpha = profile; // Force alpha to standard profile for depth vis
+        } else if (debugFlag == 2) {
+            // Normal: map view-space normal to RGB
+            vec3 n = normalize(mat3(view) * quatToRotation(quat) * vec3(0.0, 0.0, 1.0));
+            splatColor = n * 0.5 + 0.5;
+            alpha = 1.0;
+            splatAlpha = profile; // Force alpha to standard profile for normal vis
+        }
+
+        // Accumulate using standard Front-to-Back equation.
+        // C_dst = C_dst + C_src * alpha_src * (1 - A_dst)
+        // A_dst = A_dst + alpha_src * (1 - A_dst)
+        vec3 premulSplatColor = splatColor * splatAlpha;
+
+        float remaining = 1.0 - accumAlpha;
+        accumColor += premulSplatColor * remaining;
+        accumAlpha += splatAlpha * remaining;
+    }
+
+    // Keep the tile output in linear premultiplied space. The composite pass
+    // uses the same framebuffer sRGB state as the legacy path for final output.
+    imageStore(outputImage, ivec2(pixelX, pixelY), vec4(accumColor, accumAlpha));
+}

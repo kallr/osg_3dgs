@@ -752,7 +752,7 @@ namespace miniply {
             return;
           }
 
-          numBytes += uint32_t(count) * kPLYPropertySize[uint32_t(prop.type)];
+          numBytes += static_cast<size_t>(uint32_t(count)) * kPLYPropertySize[uint32_t(prop.type)];
           if (m_pos + numBytes > m_bufEnd) {
             if (!refill_buffer() || m_pos + numBytes > m_bufEnd) {
               m_valid = false;
@@ -799,7 +799,7 @@ namespace miniply {
             return;
           }
 
-          numBytes += uint32_t(count) * kPLYPropertySize[uint32_t(prop.type)];
+          numBytes += static_cast<size_t>(uint32_t(count)) * kPLYPropertySize[uint32_t(prop.type)];
           if (m_pos + numBytes > m_bufEnd) {
             if (!refill_buffer() || m_pos + numBytes > m_bufEnd) {
               m_valid = false;
@@ -1243,9 +1243,14 @@ namespace miniply {
           faceIndices.push_back(idx);
         }
 
+        if (counts[faceIdx] < 3) {
+          // 畸形面（顶点数 < 3）无法构成三角形，跳过避免 uint32 下溢
+          continue;
+        }
         triIndices.resize((counts[faceIdx] - 2) * 3);
-        triangulate_polygon(counts[faceIdx], pos, numVerts, faceIndices.data(), triIndices.data());
-        for (int idx : triIndices) {
+        uint32_t numTris = triangulate_polygon(counts[faceIdx], pos, numVerts, faceIndices.data(), triIndices.data());
+        for (uint32_t i = 0; i < numTris * 3; ++i) {
+          int idx = triIndices[i];
           copy_and_convert(to, destType, reinterpret_cast<const uint8_t*>(&idx), PLYPropertyType::Int);
           to += destValBytes;
         }
@@ -1274,9 +1279,15 @@ namespace miniply {
       triIndices.reserve(64);
       const uint8_t* face = data;
       for (uint32_t faceIdx = 0; faceIdx < elem->count; faceIdx++) {
+        if (counts[faceIdx] < 3) {
+          // 畸形面（顶点数 < 3）无法构成三角形，跳过避免 uint32 下溢
+          face += srcValBytes * counts[faceIdx];
+          continue;
+        }
         triIndices.resize((counts[faceIdx] - 2) * 3);
-        triangulate_polygon(counts[faceIdx], pos, numVerts, reinterpret_cast<const int*>(face), triIndices.data());
-        for (int idx : triIndices) {
+        uint32_t numTris = triangulate_polygon(counts[faceIdx], pos, numVerts, reinterpret_cast<const int*>(face), triIndices.data());
+        for (uint32_t i = 0; i < numTris * 3; ++i) {
+          int idx = triIndices[i];
           copy_and_convert(to, destType, reinterpret_cast<const uint8_t*>(&idx), PLYPropertyType::Int);
           to += destValBytes;
         }
@@ -1816,7 +1827,7 @@ namespace miniply {
     m_pos += countBytes;
     m_end = m_pos;
 
-    const size_t listBytes = kPLYPropertySize[uint32_t(prop.type)] * uint32_t(count);
+    const size_t listBytes = static_cast<size_t>(kPLYPropertySize[uint32_t(prop.type)]) * static_cast<size_t>(uint32_t(count));
     if (m_pos + listBytes > m_bufEnd) {
       if (!refill_buffer() || m_pos + listBytes > m_bufEnd) {
         m_valid = false;
@@ -1984,6 +1995,9 @@ namespace miniply {
       return 2;
     }
 
+    // 保存初始顶点数，用于最后返回正确的三角形数量（n 会在 ear clipping 循环中被修改）
+    const uint32_t initialN = n;
+
     // Check that all indices for this face are in the valid range before we
     // try to dereference them.
     for (uint32_t i = 0; i < n; i++) {
@@ -2051,7 +2065,7 @@ namespace miniply {
     dst[1] = indices[next[first]];
     dst[2] = indices[prev[first]];
 
-    return n - 2;
+    return initialN - 2;
   }
 
 } // namespace miniply

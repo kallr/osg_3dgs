@@ -9,16 +9,15 @@ set (CMAKE_CXX_STANDARD 17)
 
 SET (OSG_DEBUG_POSTFIX "d")
 
-# qt
-set (CMAKE_AUTOMOC ON)
-set (CMAKE_AUTORCC ON)
-set (CMAKE_AUTOUIC ON)
+option(OSG_3DGS_BUILD_GUI "Build the Qt test viewer" ON)
+if(OSG_3DGS_BUILD_GUI)
+    find_package(Qt5 REQUIRED COMPONENTS Widgets)
+endif()
+find_package(OpenGL REQUIRED)
 
-# 自动寻找QT5
-find_package (Qt5 COMPONENTS Widgets Core Gui OpenGL REQUIRED)
-
-# zlib (required by spz format)
-find_package(ZLIB)
+# zlib-backed SPZ/RAD formats
+option(OSG_3DGS_ENABLE_ZLIB_FORMATS "Enable zlib-backed SPZ/RAD support" ON)
+find_package(ZLIB QUIET)
 
 #处理osg
 IF(OSG_ROOT)
@@ -61,16 +60,6 @@ ELSE(OSG_ROOT)
     )
 ENDIF(OSG_ROOT)
 
-# include
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/GaussForge
-    ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/spz
-    ${OSG_INCLUDE_DIR}
-    ${OSG_BUILD_INCLUDE_DIR}
-)
-
 # GaussForge sources (multi-format gaussian splatting IO)
 set(GAUSSFORGE_SRC
     3rdparty/GaussForge/registry.cpp
@@ -82,8 +71,30 @@ set(GAUSSFORGE_SRC
     3rdparty/GaussForge/validate.cpp
 )
 
-# SPZ format requires zlib
-if(ZLIB_FOUND)
+# SPZ/RAD compressed formats require zlib headers and library.
+set(HAS_GAUSSIAN_ZLIB OFF)
+set(GAUSSIAN_ZLIB_TARGET "")
+if(OSG_3DGS_ENABLE_ZLIB_FORMATS)
+    if(NOT ZLIB_FOUND)
+        find_package(Qt5 COMPONENTS Core Zlib QUIET)
+    endif()
+    if(ZLIB_FOUND)
+        set(HAS_GAUSSIAN_ZLIB ON)
+        set(GAUSSIAN_ZLIB_TARGET ZLIB::ZLIB)
+    elseif(TARGET Qt5::Zlib)
+        get_target_property(QT_ZLIB_INCLUDE_DIRS Qt5::Zlib INTERFACE_INCLUDE_DIRECTORIES)
+        if(QT_ZLIB_INCLUDE_DIRS)
+            set(HAS_GAUSSIAN_ZLIB ON)
+            set(GAUSSIAN_ZLIB_TARGET Qt5::Zlib Qt5::Core)
+        else()
+            message(FATAL_ERROR "Qt5::Zlib was found but does not publish zlib include directories; install zlib or configure with -DOSG_3DGS_ENABLE_ZLIB_FORMATS=OFF to disable SPZ/RAD")
+        endif()
+    else()
+        message(FATAL_ERROR "ZLIB not found; install zlib or configure with -DOSG_3DGS_ENABLE_ZLIB_FORMATS=OFF to disable SPZ/RAD")
+    endif()
+endif()
+
+if(HAS_GAUSSIAN_ZLIB)
     list(APPEND GAUSSFORGE_SRC
         3rdparty/GaussForge/spz_reader.cpp
         3rdparty/spz/load-spz.cc
@@ -92,70 +103,114 @@ if(ZLIB_FOUND)
 endif()
 
 # 源文件
-set (SRC_FILE
-    main.cpp
-    mainwindow.cpp
-    osg/osgWindow.cpp
+set (CORE_SOURCES
+    osg/GaussianModel.cpp
     osg/GaussianDrawObj.cpp
-    tools/tools.cpp
+    osg/GaussianLODTree.cpp
+    osg/SparkShaderLibrary.cpp
+    osg/SparkOsgCallbacks.cpp
+    osg/SparkDatasetLoader.cpp
+    osg/SparkRadDatasetLoader.cpp
+    osg/SparkRadFile.cpp
+    osg/SparkRadStreamer.cpp
+    osg/SparkLodSelector.cpp
+    osg/SparkLodWorker.cpp
+    osg/SparkGpuResources.cpp
+    osg/SparkSortPass.cpp
+    osg/SparkOsgDrawable.cpp
+    osg/SparkTileBinner.cpp
+    osg/SparkTileRasterPass.cpp
+    osg/SparkCompositePass.cpp
+    osg/SparkSplatEdit.cpp
+    osg/SparkSplatSkinning.cpp
+    osg/SparkPortal.cpp
     tools/miniply.cpp
     ${GAUSSFORGE_SRC}
 )
 
 # 头文件
-set (HEADER_FILE
-    mainwindow.h
-    osg/osgWindow.h
+set (CORE_HEADERS
+    include/osg_3dgs/GaussianModel.h
     osg/GaussianDrawObj.h
-    tools/tools.h
+    osg/GaussianLODTree.h
+    osg/SparkShaderLibrary.h
+    osg/SparkOsgCallbacks.h
+    osg/SparkMaterialBuilder.h
+    osg/SparkRenderTypes.h
+    osg/SparkDatasetLoader.h
+    osg/SparkRadDatasetLoader.h
+    osg/SparkActiveSet.h
+    osg/SparkRadFile.h
+    osg/SparkRadStreamer.h
+    osg/SparkRadProtectedPages.h
+    osg/SparkLodSelector.h
+    osg/SparkLodWorker.h
+    osg/SparkGpuResources.h
+    osg/SparkSortPass.h
+    osg/SparkOsgDrawable.h
+    osg/SparkTileBinner.h
+    osg/SparkTileRasterPass.h
+    osg/SparkCompositePass.h
+    osg/SparkSplatEdit.h
+    osg/SparkSplatSkinning.h
+    osg/SparkPortal.h
     tools/miniply.h
 )
 
-# shader
-set(SHADER
-    gaussian.frag
-    gaussian.vert
-    point.vert
-    point.frag
+add_library(osg_3dgs_core STATIC ${CORE_SOURCES} ${CORE_HEADERS})
+add_library(osg_3dgs::core ALIAS osg_3dgs_core)
+target_compile_features(osg_3dgs_core PUBLIC cxx_std_17)
+target_include_directories(osg_3dgs_core
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OSG_INCLUDE_DIR}
+        ${OSG_BUILD_INCLUDE_DIR}
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/GaussForge
+        ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/spz
 )
-
-#加入项目文件
-add_executable (${PROJECT_NAME}
-    ${SRC_FILE}
-    ${HEADER_FILE}
-)
-
-# 链接Qt
-target_link_libraries(${PROJECT_NAME} Qt5::Widgets Qt5::Core Qt5::Gui)
-
-# 链接zlib (for spz format support)
-if(ZLIB_FOUND)
-    target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
-else()
-    message(WARNING "ZLIB not found - .spz format may not work")
+set_target_properties(osg_3dgs_core PROPERTIES DEBUG_POSTFIX "d" POSITION_INDEPENDENT_CODE ON)
+if(WIN32)
+    set_target_properties(osg_3dgs_core PROPERTIES
+        ARCHIVE_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_CURRENT_BINARY_DIR}/lib"
+        ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}/lib")
 endif()
 
-MACRO(LINK_OSG_LIBRARY PROJECT_NAME)
+target_link_libraries(osg_3dgs_core PRIVATE OpenGL::GL)
+if(HAS_GAUSSIAN_ZLIB)
+    target_link_libraries(osg_3dgs_core PRIVATE ${GAUSSIAN_ZLIB_TARGET})
+    target_compile_definitions(osg_3dgs_core PRIVATE HAVE_ZLIB=1 HAS_ZLIB=1)
+endif()
+
+FUNCTION(LINK_OSG_LIBRARY target visibility)
     FOREACH(OSG_LIB_NAME ${ARGN})
-        TARGET_LINK_LIBRARIES(${PROJECT_NAME}
+        TARGET_LINK_LIBRARIES(${target} ${visibility}
             debug     ${OSG_DEBUG_LIB_DIR}/${OSG_LIB_NAME}${OSG_DEBUG_POSTFIX}.lib
             optimized ${OSG_RELEASE_LIB_DIR}/${OSG_LIB_NAME}.lib)
     ENDFOREACH()
-ENDMACRO(LINK_OSG_LIBRARY)
-LINK_OSG_LIBRARY(${PROJECT_NAME} osgDB osgUtil osgViewer osgGA osg OpenThreads)
+ENDFUNCTION()
+LINK_OSG_LIBRARY(osg_3dgs_core PUBLIC osg OpenThreads)
+LINK_OSG_LIBRARY(osg_3dgs_core PRIVATE osgDB osgUtil)
 
-# Debug/Release库后缀自动处理
-if(WIN32)
-    set_target_properties(${PROJECT_NAME} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_BINARY_DIR}/bin
-        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin
+if(OSG_3DGS_BUILD_GUI)
+    add_executable(osg_gaussian_draw main.cpp mainwindow.cpp mainwindow.h osg/osgWindow.cpp osg/osgWindow.h)
+    set_target_properties(osg_gaussian_draw PROPERTIES
+        AUTOMOC ON AUTORCC ON AUTOUIC ON DEBUG_POSTFIX "d")
+    target_include_directories(osg_gaussian_draw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(osg_gaussian_draw PRIVATE osg_3dgs::core Qt5::Widgets OpenGL::GL)
+    LINK_OSG_LIBRARY(osg_gaussian_draw PRIVATE osgDB osgUtil osgViewer osgGA)
+    if(WIN32)
+        set_target_properties(osg_gaussian_draw PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG   "${CMAKE_CURRENT_BINARY_DIR}/bin"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}/bin")
+    endif()
+
+    add_custom_command(TARGET osg_gaussian_draw POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/shader"
+        "$<TARGET_FILE_DIR:osg_gaussian_draw>/shader"
+        COMMENT "Copying shader files to output directory"
     )
 endif()
-
-# 自动复制shader文件到输出目录
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    "${CMAKE_SOURCE_DIR}/shader"
-    "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shader"
-    COMMENT "Copying shader files to output directory"
-)

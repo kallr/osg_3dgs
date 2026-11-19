@@ -1,0 +1,69 @@
+#version 430 core
+
+// GPU bitonic compare-swap pass over depthKeys/sortIndices.
+layout(local_size_x = 256) in;
+
+uniform int activeCount;
+uniform int sortCount;
+uniform int sortStage;
+uniform int sortPass;
+uniform bool sortAscending;
+
+layout(std430, binding = 1) buffer DepthKeyBuffer
+{
+    uint depthKeys[];
+};
+
+layout(std430, binding = 2) buffer SortIndexBuffer
+{
+    int sortIndices[];
+};
+
+void swapPair(uint a, uint b)
+{
+    uint keyA = depthKeys[int(a)];
+    uint keyB = depthKeys[int(b)];
+    int indexA = sortIndices[int(a)];
+    int indexB = sortIndices[int(b)];
+
+    depthKeys[int(a)] = keyB;
+    depthKeys[int(b)] = keyA;
+    sortIndices[int(a)] = indexB;
+    sortIndices[int(b)] = indexA;
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(sortCount))
+        return;
+
+    uint j = i ^ uint(sortPass);
+    if (j <= i || j >= uint(sortCount))
+        return;
+
+    bool ascending = ((i & uint(sortStage)) == 0u) ? sortAscending : !sortAscending;
+    uint keyI = depthKeys[int(i)];
+    uint keyJ = depthKeys[int(j)];
+    int indexI = sortIndices[int(i)];
+    int indexJ = sortIndices[int(j)];
+
+    bool padI = indexI < 0;
+    bool padJ = indexJ < 0;
+    bool shouldSwap = false;
+    if (padI != padJ) {
+        // Valid splats precede padding in the final order, for either sort
+        // direction. Reverse that ordering only in the opposite bitonic runs.
+        bool finalDirection = ascending == sortAscending;
+        shouldSwap = finalDirection ? padI : padJ;
+    } else if (keyI == keyJ) {
+        // Bitonic sort is not stable by default.  Use the resolved splat index
+        // as a deterministic secondary key to avoid frame-to-frame reordering
+        // shimmer when many splats share the same depth bucket.
+        shouldSwap = ascending ? (indexI > indexJ) : (indexI < indexJ);
+    } else {
+        shouldSwap = ascending ? (keyI > keyJ) : (keyI < keyJ);
+    }
+    if (shouldSwap)
+        swapPair(i, j);
+}

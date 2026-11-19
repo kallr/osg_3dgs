@@ -1,0 +1,45 @@
+#version 430 core
+
+// Tile binning clear pass. Clears per-tile counters before gaussian_tile_bin.comp
+// accumulates screen-space splat coverage. This is a Spark-direction skeleton:
+// tile lists are not consumed by draw yet.
+layout(local_size_x = 256) in;
+
+uniform int tileCount;
+uniform int tileListCapacity;
+uniform int dispatchGroupsX;
+
+layout(std430, binding = 3) buffer TileCountBuffer
+{
+    uint tileCounts[];
+};
+
+layout(std430, binding = 4) buffer TileCursorBuffer
+{
+    uint tileCursors[];
+};
+
+layout(std430, binding = 5) buffer TileListBuffer
+{
+    int tileList[];
+};
+
+layout(std430, binding = 6) buffer TileStatsBuffer
+{
+    uint tileStats[];
+};
+
+void main()
+{
+    // 2D dispatch: global invocation id = (gl_WorkGroupID.x + gl_WorkGroupID.y * dispatchGroupsX) * 256 + gl_LocalInvocationID.x
+    uint groupIndex = gl_WorkGroupID.x + gl_WorkGroupID.y * uint(dispatchGroupsX);
+    uint i = groupIndex * 256u + gl_LocalInvocationID.x;
+    if (i < uint(tileCount)) {
+        tileCounts[int(i)] = 0u;
+        tileCursors[int(i)] = 0u;
+    }
+    if (i < uint(tileListCapacity))
+        tileList[int(i)] = -1;
+    if (i < 4u)
+        tileStats[int(i)] = 0u;
+}
